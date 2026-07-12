@@ -1,0 +1,20 @@
+edge_id,from_layer,from_table,from_column,to_layer,to_table,to_column,transform_rule_id,transform_description
+E001,bronze,crm_customers_raw,first_name,silver,silver_customers,first_name,R006,Trim + proper case
+E002,bronze,crm_customers_raw,last_name,silver,silver_customers,last_name,R007,Trim + proper case
+E003,bronze,crm_customers_raw,email,silver,silver_customers,email,R003,Validated against email regex
+E004,bronze,crm_customers_raw,phone,silver,silver_customers,phone,R008,Standardized to +1 E.164-style format
+E005,bronze,crm_customers_raw,state,silver,silver_customers,state_code,R004,Validated against ref_state_codes
+E006,bronze,crm_customers_raw,country,silver,silver_customers,country_code,R005,Validated against ref_country_codes
+E007,bronze,erp_customers_raw,full_name,silver,silver_customers,first_name,R009,Split on comma; second token; proper case
+E008,bronze,erp_customers_raw,full_name,silver,silver_customers,last_name,R009,Split on comma; first token; proper case
+E009,bronze,erp_customers_raw,email_addr,silver,silver_customers,email,R010,Lowercased and validated against email regex
+E010,bronze,erp_customers_raw,contact_phone,silver,silver_customers,phone,R015,Standardized to +1 E.164-style format
+E011,bronze,erp_customers_raw,state_code,silver,silver_customers,state_code,R012,Validated against ref_state_codes
+E012,bronze,erp_customers_raw,country_code,silver,silver_customers,country_code,R013,Validated against ref_country_codes
+E013,silver,silver_customers,email,gold,gold_match_candidates,match_email,MATCH01,Normalized match key for deterministic matching
+E014,silver,silver_customers,phone,gold,gold_match_candidates,match_phone,MATCH01,Normalized match key for deterministic matching
+E015,gold,gold_match_candidates,*,gold,gold_customers,*,SURV01,Record-level survivorship: most recently modified source wins
+E016,gold,gold_match_candidates,*,gold,gold_crosswalk,*,SURV01,Every contributing source record retained with confidence score
+E017,silver,exceptions_queue,*,stewardship_app,remediation_log,*,STEW01,Steward-reviewed corrections re-enter the pipeline at silver
+E018,gold,gold_match_candidates,match_email,gold,gold_match_candidates,*,MATCH01,Match key feeds the survivorship computation
+E019,gold,gold_match_candidates,match_phone,gold,gold_match_candidates,*,MATCH01,Match key feeds the survivorship computation

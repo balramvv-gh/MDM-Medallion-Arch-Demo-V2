@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Stewardship Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #12161c;
+    --panel: #1a2029;
+    --panel-raised: #212836;
+    --border: #2a3140;
+    --text: #e6e9ef;
+    --text-dim: #8b93a3;
+    --amber: #e8a54b;
+    --amber-dim: #4a3a24;
+    --red: #e05a5a;
+    --green: #5bc98a;
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'Manrope', sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+  }
+  header {
+    padding: 28px 40px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+  header .brand { display: flex; align-items: baseline; gap: 14px; }
+  header h1 {
+    font-size: 20px;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    margin: 0;
+  }
+  header .tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--amber);
+    background: var(--amber-dim);
+    padding: 3px 8px;
+    border-radius: 4px;
+    letter-spacing: 0.04em;
+  }
+  header .queue-count {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  header .queue-count b { color: var(--amber); font-size: 16px; }
+
+  main {
+    display: grid;
+    grid-template-columns: 380px 1fr;
+    gap: 0;
+    min-height: calc(100vh - 78px);
+  }
+  .queue-panel {
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    max-height: calc(100vh - 78px);
+  }
+  .queue-item {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    transition: background 0.12s ease;
+  }
+  .queue-item:hover { background: var(--panel); }
+  .queue-item.active { background: var(--panel-raised); border-left: 3px solid var(--amber); }
+  .queue-item .qid {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .queue-item .qname { font-size: 15px; font-weight: 600; margin: 4px 0; }
+  .queue-item .qreason {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--red);
+    background: rgba(224,90,90,0.1);
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 3px;
+    margin-top: 4px;
+  }
+
+  .detail-panel { padding: 32px 40px; overflow-y: auto; max-height: calc(100vh - 78px); }
+  .empty-state {
+    color: var(--text-dim);
+    font-size: 15px;
+    padding-top: 60px;
+    text-align: center;
+  }
+  .record-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+  }
+  .record-header h2 { margin: 0; font-size: 22px; }
+  .source-badge {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+    padding: 4px 10px;
+    border-radius: 4px;
+  }
+  .reasons-box {
+    background: rgba(224,90,90,0.08);
+    border: 1px solid rgba(224,90,90,0.3);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 24px;
+  }
+  .reasons-box .label {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--red);
+    letter-spacing: 0.05em;
+    margin-bottom: 6px;
+  }
+  .reasons-box ul { margin: 0; padding-left: 18px; font-size: 13px; color: var(--text); }
+
+  .field-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 14px;
+    margin-bottom: 24px;
+  }
+  .field {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .field label {
+    display: block;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+  }
+  .field input {
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: var(--text);
+    font-size: 14px;
+    font-family: var(--mono);
+    outline: none;
+  }
+  .field.changed { border-color: var(--amber); background: var(--amber-dim); }
+  .field.changed input { color: var(--amber); }
+
+  .ai-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 24px;
+  }
+  .ai-panel .ai-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .ai-panel .ai-header .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--amber);
+  }
+  .ai-panel .ai-header span { font-family: var(--mono); font-size: 12px; color: var(--amber); letter-spacing: 0.04em; }
+  .ai-panel .rationale { font-size: 14px; line-height: 1.5; color: var(--text); margin-bottom: 10px; }
+  .ai-panel .source-tag { font-family: var(--mono); font-size: 10px; color: var(--text-dim); }
+
+  .actions { display: flex; gap: 12px; }
+  button {
+    font-family: var(--sans);
+    font-weight: 700;
+    font-size: 14px;
+    padding: 10px 20px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    transition: transform 0.08s ease, opacity 0.12s ease;
+  }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-suggest { background: var(--panel-raised); color: var(--amber); border: 1px solid var(--amber); }
+  .btn-resolve { background: var(--green); color: #0a1710; }
+  .btn-reject { background: transparent; color: var(--red); border: 1px solid var(--red); }
+  .toast {
+    position: fixed; bottom: 24px; right: 24px;
+    background: var(--panel-raised); border: 1px solid var(--border);
+    padding: 12px 18px; border-radius: 8px; font-size: 13px;
+    display: none;
+  }
+
+  /* ---------- Login screen ---------- */
+  #loginScreen { min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .login-box {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 40px 36px; width: 340px;
+  }
+  .login-box h1 { font-size: 18px; margin: 0 0 4px; }
+  .login-box .sub { font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-bottom: 24px; }
+  .login-box label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 6px; margin-top: 16px; }
+  .login-box input {
+    width: 100%; background: var(--panel-raised); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px; color: var(--text); font-size: 14px; outline: none; font-family: var(--sans);
+  }
+  .login-box input:focus { border-color: var(--amber); }
+  .login-box button {
+    width: 100%; margin-top: 22px; background: var(--amber); color: #241a08; border: none;
+    padding: 11px; border-radius: 8px; font-weight: 700; font-size: 14px; cursor: pointer;
+  }
+  .login-error { color: var(--red); font-size: 12px; margin-top: 12px; display: none; }
+
+  /* ---------- Access denied ---------- */
+  #accessDenied { min-height: 100vh; display: none; align-items: center; justify-content: center; }
+  .denied-box {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 36px 40px; width: 420px; text-align: center;
+  }
+  .denied-box h1 { font-size: 18px; margin: 0 0 12px; color: var(--red); }
+  .denied-box p { font-size: 13px; color: var(--text-dim); line-height: 1.6; margin: 0 0 20px; }
+  .denied-box button {
+    background: transparent; border: 1px solid var(--border); color: var(--text);
+    padding: 9px 18px; border-radius: 7px; font-size: 13px; cursor: pointer;
+  }
+
+  /* ---------- User chip (header) ---------- */
+  .user-chip { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+  .user-chip .role-badge {
+    font-family: var(--mono); font-size: 10px; color: var(--amber); background: var(--amber-dim);
+    padding: 2px 8px; border-radius: 4px;
+  }
+  .user-chip button {
+    background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+    padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  }
+  header .header-right { display: flex; align-items: center; gap: 20px; }
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="loginScreen">
+  <div class="login-box">
+    <h1>Data Stewardship Console</h1>
+    <div class="sub">SIGN IN TO CONTINUE</div>
+    <label>Username</label>
+    <input type="text" id="loginUsername" autocomplete="username">
+    <label>Password</label>
+    <input type="password" id="loginPassword" autocomplete="current-password">
+    <button onclick="doLogin()">Sign in</button>
+    <div class="login-error" id="loginError">Invalid username or password.</div>
+  </div>
+</div>
+
+<!-- ACCESS DENIED -->
+<div id="accessDenied">
+  <div class="denied-box">
+    <h1>Access denied</h1>
+    <p id="deniedMessage">This console is restricted to Data Steward and Data Owner roles.</p>
+    <button onclick="doLogout()">Sign out</button>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="appShell" style="display:none;">
+<header>
+  <div class="brand">
+    <h1>Data Stewardship Console</h1>
+    <span class="tag">MDM DEMO</span>
+  </div>
+  <div class="header-right">
+    <div class="queue-count">Open exceptions: <b id="queueCount">--</b></div>
+    <div class="user-chip">
+      <span id="userFullName"></span>
+      <span class="role-badge" id="userRoleBadge"></span>
+      <button onclick="doLogout()">Sign out</button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="queue-panel" id="queuePanel">
+    <div class="empty-state">Loading queue…</div>
+  </div>
+  <div class="detail-panel" id="detailPanel">
+    <div class="empty-state">Select a record from the queue to begin remediation.</div>
+  </div>
+</main>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '/api/v1';
+const SESSION_KEY = 'mdm_session';   // shared across /portal and /app (same origin) for single sign-on
+const ALLOWED_ROLES = ['dataSteward', 'dataOwner'];
+const ROLE_LABELS = { admin: 'Admin', dataSteward: 'Data Steward', dataOwner: 'Data Owner', businessUser: 'Business User' };
+function roleLabel(role) { return ROLE_LABELS[role] || role; }
+
+let session = null;           // {token, user}
+let currentItem = null;
+let editedFields = {};
+
+function authHeaders() {
+  return { 'Authorization': `Bearer ${session.token}`, 'Content-Type': 'application/json' };
+}
+
+function saveSession(s) {
+  session = s;
+  localStorage.setItem(SESSION_KEY, JSON.stringify(s));
+}
+
+function clearSession() {
+  session = null;
+  localStorage.removeItem(SESSION_KEY);
+}
+
+function showScreen(id) {
+  ['loginScreen', 'accessDenied', 'appShell'].forEach(s => {
+    document.getElementById(s).style.display = s === id ? (s === 'appShell' ? 'block' : 'flex') : 'none';
+  });
+}
+
+function enterApp() {
+  if (!ALLOWED_ROLES.includes(session.user.role)) {
+    document.getElementById('deniedMessage').textContent =
+      `Signed in as ${session.user.full_name} (${roleLabel(session.user.role)}). ` +
+      `This console is restricted to Data Steward and Data Owner roles.`;
+    showScreen('accessDenied');
+    return;
+  }
+  document.getElementById('userFullName').textContent = session.user.full_name;
+  document.getElementById('userRoleBadge').textContent = roleLabel(session.user.role).toUpperCase();
+  showScreen('appShell');
+  loadQueue();
+}
+
+async function tryRestoreSession() {
+  const raw = localStorage.getItem(SESSION_KEY);
+  if (!raw) { showScreen('loginScreen'); return; }
+  try {
+    const stored = JSON.parse(raw);
+    const res = await fetch(`${API}/auth/me`, { headers: { 'Authorization': `Bearer ${stored.token}` } });
+    if (res.ok) {
+      session = stored;
+      enterApp();
+    } else {
+      clearSession();
+      showScreen('loginScreen');
+    }
+  } catch (e) {
+    clearSession();
+    showScreen('loginScreen');
+  }
+}
+
+async function doLogin() {
+  const username = document.getElementById('loginUsername').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  const res = await fetch(`${API}/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!res.ok) {
+    document.getElementById('loginError').style.display = 'block';
+    return;
+  }
+  document.getElementById('loginError').style.display = 'none';
+  saveSession(await res.json());
+  enterApp();
+}
+
+async function doLogout() {
+  if (session) {
+    await fetch(`${API}/auth/logout`, { method: 'POST', headers: authHeaders() });
+  }
+  clearSession();
+  document.getElementById('loginPassword').value = '';
+  document.getElementById('loginError').style.display = 'none';
+  showScreen('loginScreen');
+}
+
+async function loadQueue() {
+  const res = await fetch(`${API}/stewardship/queue?status=open`, { headers: authHeaders() });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('queueCount').textContent = data.count;
+  const panel = document.getElementById('queuePanel');
+  if (data.items.length === 0) {
+    panel.innerHTML = '<div class="empty-state">Queue is empty. All records have been remediated.</div>';
+    return;
+  }
+  panel.innerHTML = data.items.map(item => `
+    <div class="queue-item" data-id="${item.exception_id}" onclick="selectItem('${item.exception_id}')">
+      <div class="qid">${item.source_system} · ${item.source_record_id}</div>
+      <div class="qname">${item.first_name || '(no first name)'} ${item.last_name || '(no last name)'}</div>
+      ${item.reject_reasons.map(r => `<span class="qreason">${r}</span>`).join(' ')}
+    </div>
+  `).join('');
+}
+
+async function selectItem(exceptionId) {
+  document.querySelectorAll('.queue-item').forEach(el => el.classList.toggle('active', el.dataset.id === exceptionId));
+  const res = await fetch(`${API}/stewardship/queue/${exceptionId}`, { headers: authHeaders() });
+  currentItem = await res.json();
+  editedFields = {};
+  renderDetail();
+}
+
+const FIELD_LABELS = [
+  ['first_name', 'First name'], ['last_name', 'Last name'], ['email', 'Email'],
+  ['phone', 'Phone'], ['address_line1', 'Address'], ['city', 'City'],
+  ['state_code', 'State'], ['postal_code', 'Postal code'], ['country_code', 'Country'],
+];
+
+function renderDetail() {
+  const panel = document.getElementById('detailPanel');
+  const item = currentItem;
+  panel.innerHTML = `
+    <div class="record-header">
+      <h2>${item.first_name || '—'} ${item.last_name || '—'}</h2>
+      <span class="source-badge">${item.source_system} · ${item.source_record_id}</span>
+    </div>
+    <div class="reasons-box">
+      <div class="label">FAILED VALIDATION</div>
+      <ul>${item.reject_reasons.map(r => `<li>${r}</li>`).join('')}</ul>
+    </div>
+    <div class="field-grid" id="fieldGrid">
+      ${FIELD_LABELS.map(([key, label]) => `
+        <div class="field" id="field-${key}">
+          <label>${label}</label>
+          <input type="text" value="${item[key] ?? ''}" oninput="onFieldEdit('${key}', this.value)">
+        </div>
+      `).join('')}
+    </div>
+    <div id="aiPanelContainer"></div>
+    <div class="actions">
+      <button class="btn-suggest" onclick="getSuggestion()">✨ Get AI suggestion</button>
+      <button class="btn-resolve" onclick="resolveItem()">Approve & resolve</button>
+      <button class="btn-reject" onclick="rejectItem()">Reject record</button>
+    </div>
+  `;
+}
+
+function onFieldEdit(key, value) {
+  editedFields[key] = value;
+  document.getElementById(`field-${key}`).classList.add('changed');
+}
+
+async function getSuggestion() {
+  const btn = document.querySelector('.btn-suggest');
+  btn.disabled = true;
+  btn.textContent = 'Thinking…';
+  const res = await fetch(`${API}/stewardship/queue/${currentItem.exception_id}/suggest`, { method: 'POST', headers: authHeaders() });
+  const suggestion = await res.json();
+  btn.disabled = false;
+  btn.textContent = '✨ Get AI suggestion';
+
+  document.getElementById('aiPanelContainer').innerHTML = `
+    <div class="ai-panel">
+      <div class="ai-header"><span class="dot"></span><span>SUGGESTED REMEDIATION</span></div>
+      <div class="rationale">${suggestion.rationale}</div>
+      <div class="source-tag">source: ${suggestion.source}</div>
+    </div>
+  `;
+
+  for (const [key, value] of Object.entries(suggestion.suggested_fields)) {
+    const input = document.querySelector(`#field-${key} input`);
+    if (input) {
+      input.value = value;
+      onFieldEdit(key, value);
+    }
+  }
+}
+
+async function resolveItem() {
+  const res = await fetch(`${API}/stewardship/queue/${currentItem.exception_id}/resolve`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ applied_fields: editedFields, steward_note: 'Resolved via stewardship console' }),
+  });
+  if (res.ok) {
+    const data = await res.json();
+    const rp = data.reprocessing;
+    let msg = 'Record resolved.';
+    if (rp) {
+      msg = rp.action === 'created_new_golden_record'
+        ? `Resolved — no match found, created new golden record ${rp.golden_id}.`
+        : `Resolved — matched and updated golden record ${rp.golden_id} (${rp.matched_existing_sources} other source${rp.matched_existing_sources === 1 ? '' : 's'}).`;
+    }
+    showToast(msg);
+    currentItem = null;
+    document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select a record from the queue to begin remediation.</div>';
+    loadQueue();
+  }
+}
+
+async function rejectItem() {
+  const res = await fetch(`${API}/stewardship/queue/${currentItem.exception_id}/reject`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ steward_note: 'Rejected via stewardship console' }),
+  });
+  if (res.ok) {
+    showToast('Record rejected.');
+    currentItem = null;
+    document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select a record from the queue to begin remediation.</div>';
+    loadQueue();
+  }
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3000);
+}
+
+tryRestoreSession();
+</script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+name: 'mdm_demo'
+version: '1.0.0'
+config-version: 2
+profile: 'mdm_demo'
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+seeds:
+  mdm_demo:
+    +schema: rules
+
+models:
+  mdm_demo:
+    silver:
+      +schema: silver
+      +materialized: table
+    gold:
+      +schema: gold
+      +materialized: table

@@ -1,0 +1,9 @@
+mdm_demo:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      # Relative to the directory dbt is invoked from (the dbt_project folder,
+      # per the README's run instructions) -- portable across machines/OSes.
+      path: "../mdm_demo.duckdb"
+      threads: 4

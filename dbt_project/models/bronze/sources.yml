@@ -1,0 +1,8 @@
+version: 2
+
+sources:
+  - name: bronze
+    schema: bronze
+    tables:
+      - name: crm_customers_raw
+      - name: erp_customers_raw

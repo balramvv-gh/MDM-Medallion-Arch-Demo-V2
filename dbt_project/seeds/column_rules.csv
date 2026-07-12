@@ -1,0 +1,16 @@
+rule_id,source_system,source_column,rule_type,rule_param,severity,active,description
+R001,CRM,first_name,not_null,,reject,true,First name is required
+R002,CRM,last_name,not_null,,reject,true,Last name is required
+R003,CRM,email,regex,^[^@\s]+@[^@\s]+\.[^@\s]+$,reject,true,Email must match standard format
+R004,CRM,state,reference_state,,reject,true,State must be a valid two-letter US state code
+R005,CRM,country,reference_country,,reject,true,Country must be a valid ISO country code
+R006,CRM,first_name,trim_case_proper,,correct,true,Trim whitespace and apply proper case
+R007,CRM,last_name,trim_case_proper,,correct,true,Trim whitespace and apply proper case
+R008,CRM,phone,standardize_phone_us,,correct,true,Standardize to E.164-style +1 format
+R009,ERP,full_name,not_null,,reject,true,Full name is required
+R010,ERP,email_addr,regex,^[^@\s]+@[^@\s]+\.[^@\s]+$,reject,true,Email must match standard format
+R011,ERP,contact_phone,not_null,,reject,true,Phone is required
+R012,ERP,state_code,reference_state,,reject,true,State must be a valid two-letter US state code
+R013,ERP,country_code,reference_country,,reject,true,Country must be a valid ISO country code
+R014,ERP,email_addr,lowercase,,correct,true,Normalize email to lowercase
+R015,ERP,contact_phone,standardize_phone_us,,correct,true,Standardize to E.164-style +1 format
