@@ -11,11 +11,19 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
 - **Silver layer** — cleansing, standardization, and validation driven entirely by
   **metadata** (`dbt_project/seeds/column_rules.csv`), not hardcoded logic. Records
   that fail validation are routed to an exception queue instead of the pipeline.
-- **Gold layer (Data Hub)** — deterministic match/merge across source systems,
-  record-level survivorship, and a **crosswalk table** that preserves the link
-  between every golden record and its contributing source records, with match
-  confidence scores.
-- **Data Stewardship app** (`/app/`) — a console for reviewing rejected records,
+- **Gold layer (Data Hub)** — hybrid match/merge across source systems:
+  deterministic exact matching on normalized email/phone, plus an
+  **embedding-similarity (fuzzy) tier** that catches near-duplicates exact
+  matching misses (typos, nicknames, reformatted addresses) via TF-IDF
+  character n-gram cosine similarity, computed in `scripts/generate_matches.py`
+  and clustered with union-find. High-confidence fuzzy matches auto-merge;
+  borderline ones go to a **Match Review queue** for a data steward to confirm
+  or reject. Record-level survivorship and a **crosswalk table** preserve the
+  link between every golden record and its contributing source records, with
+  a graduated match confidence score (1.00 for exact, the actual similarity
+  score for fuzzy, 0.50 "provisional" for uncorroborated single-source records).
+- **Data Stewardship app** (`/app/`) — restricted to `dataSteward` / `dataOwner`
+  accounts, two tabs: an **Exception Queue** console for reviewing rejected records,
   getting an AI-assisted remediation suggestion (Claude, with a heuristic fallback
   if no API key is configured), and approving/rejecting corrections. Approving a
   correction triggers real-time **reprocessing**: the corrected record is upserted
@@ -23,14 +31,22 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
   survivorship is re-run to either update the matched golden record (recomputing
   the survivor across the whole contributing group) or create a brand-new golden
   record if no match is found. The console shows you which happened and which
-  `golden_id` was affected.
+  `golden_id` was affected. And a **Match Review** tab: borderline fuzzy-match
+  candidates from the gold layer's embedding-similarity tier, shown side by
+  side, for the steward to confirm ("same customer, merge them") or reject
+  ("coincidence, keep separate"). Unlike exception resolution, this doesn't
+  reprocess in real time — the decision takes effect on the next pipeline
+  rebuild (see `scripts/generate_matches.py`).
 - **MDM Data Hub Portal** (`/portal/`) — a **login-gated** application for browsing
   the gold layer (search, paginate, view a record's full source crosswalk, and edit
   it if your account has write access), plus an **Administration → User
   Administration** screen for managing portal accounts: creating users, assigning
-  roles (`admin` / `steward` / `viewer`) and gold-layer access (`read_write` / `read`
-  / `none`), deactivating accounts, and resetting passwords. Passwords are stored as
-  bcrypt hashes — never in plaintext.
+  roles (`admin` / `dataSteward` / `dataOwner` / `businessUser`) and gold-layer access
+  (`read_write` / `read` / `none`), deactivating accounts, and resetting passwords.
+  Passwords are stored as bcrypt hashes — never in plaintext. Note: `admin` is a
+  distinct governance function (user administration) and is deliberately **not** a
+  superset of stewardship rights — an admin account cannot access the Data
+  Stewardship console or its API endpoints; only `dataSteward` / `dataOwner` can.
 - **Data Governance** (`/portal/`, "Data Governance" tab) — an explorable **network
   diagram** of the entire lineage metadata graph (bronze → silver → gold →
   stewardship), pannable and zoomable. Click any node to highlight its full
@@ -46,6 +62,11 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
 
 - **dbt-core + DuckDB** for the pipeline (genuinely "dbt-style" — runs locally with
   zero cloud cost, no Databricks account needed)
+- **scikit-learn** (TF-IDF + cosine similarity) for the fuzzy-matching tier — a
+  lightweight, fully-local embedding technique (no model download, no GPU, no
+  cloud API) chosen over a neural sentence-embedding model to keep setup fast
+  and the demo runnable fully offline
+- **Faker** to generate a larger, more realistic synthetic source population
 - **FastAPI** for the app backends and REST API, with bcrypt-hashed password auth
 - Plain HTML/JS frontends for both apps (no build step, no Node.js needed)
 
@@ -74,19 +95,45 @@ pip install -r requirements.txt
 ### Build the pipeline
 
 ```powershell
-# 1. Generate synthetic source data (CRM + ERP CSV extracts)
+# 1. Generate synthetic source data (CRM + ERP CSV extracts, ~100 rows each)
 python data\generate_source_data.py
 
 # 2. Land it in the bronze layer
 python scripts\load_bronze.py
 
-# 3. Load rules/reference metadata, then build silver + gold
+# 3. Build the rest of the pipeline (seed -> silver -> match/merge -> gold)
+python scripts\build_pipeline.py
+```
+
+`build_pipeline.py` runs four steps in order and stops if any of them fail:
+
+```powershell
 cd dbt_project
 $env:DBT_PROFILES_DIR = "."
-dbt seed
-dbt run
+dbt --no-partial-parse seed
+dbt --no-partial-parse run --exclude gold.*
+cd ..
+python scripts\generate_matches.py     # embedding-based match/merge -- needs silver, produces gold's input
+cd dbt_project
+dbt --no-partial-parse run --select gold.*
 cd ..
 ```
+
+`--no-partial-parse` forces a full reparse instead of trusting dbt's
+`target/partial_parse.msgpack` cache. Without it, a manifest cache left over
+from a previous run (different machine, different OS, or just a moved/copied
+project folder) can go stale and raise a `KeyError` looking up a macro file
+that doesn't match the current parse. `build_pipeline.py` already passes this
+flag; include it if you run the commands manually too.
+
+The gold layer now depends on a Python step (`scripts/generate_matches.py`,
+TF-IDF embedding similarity via scikit-learn) that has to run strictly between
+silver and gold, so a single `dbt run` can no longer build the whole pipeline
+end to end — run `build_pipeline.py`, or the four commands above, instead.
+If you only changed something silver-or-earlier and don't need to re-match,
+`dbt run --exclude gold.*` alone is enough; if you only changed a steward's
+match-review decision, `python scripts\generate_matches.py` followed by
+`dbt run --select gold.*` is enough.
 
 This produces `mdm_demo.duckdb` in the project root — a single-file database
 containing every layer (bronze, silver, gold, rules metadata, lineage metadata,
@@ -138,11 +185,7 @@ pip install -r requirements.txt
 
 python3 data/generate_source_data.py
 python3 scripts/load_bronze.py
-
-cd dbt_project
-DBT_PROFILES_DIR=. dbt seed
-DBT_PROFILES_DIR=. dbt run
-cd ..
+python3 scripts/build_pipeline.py      # seed -> silver -> match/merge -> gold
 
 python3 scripts/create_admin_user.py   # copy the printed one-time password
 
@@ -174,15 +217,32 @@ Enable AI remediation with `export ANTHROPIC_API_KEY=your_key_here` before start
 | `POST /api/v1/stewardship/queue/{id}/suggest` | Get AI/heuristic remediation suggestion |
 | `POST /api/v1/stewardship/queue/{id}/resolve` | Approve a correction |
 | `POST /api/v1/stewardship/queue/{id}/reject` | Reject a record |
+| `GET /api/v1/stewardship/match-review?status=pending` | Borderline fuzzy-match candidates (dataSteward/dataOwner role required) |
+| `GET /api/v1/stewardship/match-review/{pair_id}` | One match-review candidate pair, full side-by-side detail |
+| `POST /api/v1/stewardship/match-review/{pair_id}/confirm` | Confirm a pair is the same customer (merges on the next pipeline rebuild) |
+| `POST /api/v1/stewardship/match-review/{pair_id}/reject` | Reject a pair as coincidental (permanently excluded going forward) |
 
 All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints require an
 `Authorization: Bearer <token>` header from `/api/v1/auth/login`.
 
 ## Design notes / known simplifications (by design, for demo scope)
 
-- **Matching** is deterministic (exact match on normalized email or phone), not
-  fuzzy/probabilistic — a production system would add name/address similarity
-  scoring. This keeps the survivorship and crosswalk logic easy to follow.
+- **Matching** is a hybrid of deterministic exact matching (normalized email or
+  phone, confidence 1.00) and an embedding-similarity fuzzy tier (TF-IDF
+  character n-gram cosine similarity over name/address text, blocked by
+  state_code). Fuzzy matches above a calibrated high threshold auto-merge with
+  their similarity score as confidence; borderline ones go to a **Match
+  Review** queue for a steward to confirm or reject rather than auto-merging.
+  This is a real embedding-similarity technique used in production dedup
+  systems, deliberately kept lightweight (no model download, fully offline,
+  no GPU) rather than a neural sentence-embedding model — a reasonable next
+  iteration if higher recall on more subtle near-duplicates is needed. See
+  `scripts/generate_matches.py` for the full algorithm and calibration notes.
+  **Known gap:** the real-time reprocessing path (steward resolves a
+  validation exception → immediate re-match) still only does exact matching;
+  the fuzzy tier only runs in the batch pipeline. Fitting a TF-IDF vectorizer
+  per API request was judged not worth the added request latency for a
+  demo-scoped feature.
 - **Survivorship** is record-level (most-recently-modified source wins for the
   whole record), not attribute-level — a natural next iteration.
 - Rules are documented as metadata (`column_rules.csv`) and referenced by rule ID
@@ -194,11 +254,14 @@ All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints requ
   would typically delegate this to an identity provider (Okta, Azure AD, etc.).
 - The database (`mdm_demo.duckdb`) is a single local file — fine for a demo, not a
   substitute for a real concurrent multi-user warehouse.
-- **Steward-corrected records are not re-run through the automated validation
-  rules** — a steward's approval is treated as authoritative (human-in-the-loop
-  override, a standard MDM pattern). The corrected record's "modified" timestamp
-  is stamped as the moment of correction, so under the recency-wins survivorship
-  rule a fresh correction will typically become the new survivor.
+- **Steward-corrected records ARE re-run through the reject-severity validation
+  rules** (`api/validation.py`, mirroring `column_rules.csv`) before reprocessing.
+  If the correction still fails validation, the steward sees an alert explaining
+  what's still wrong and the record stays in the exception queue — it is not
+  marked resolved and does not reach match/merge. Only once a correction
+  genuinely passes validation does it flow through, at which point the "modified"
+  timestamp is stamped as the moment of correction, so under the recency-wins
+  survivorship rule a fresh correction will typically become the new survivor.
 - The real-time reprocessing match step compares against each existing golden
   record's *current* (survivor) email/phone, not every historical non-survivor
   source in that group — consistent with the record-level (not attribute-level)

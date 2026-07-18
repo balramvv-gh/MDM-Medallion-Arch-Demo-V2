@@ -640,16 +640,21 @@ function showToast(msg) {
 
 // ---------------- Data Governance: network diagram ----------------
 
-const LAYER_RANK = { bronze: 0, silver: 1, gold: 2, stewardship_app: 3, stewardship: 3 };
+const LAYER_RANK = { bronze: 0, silver: 1, gold_prep: 2, gold: 3, stewardship_app: 4, stewardship: 4 };
 const NODE_DESCRIPTIONS = {
   'bronze.crm_customers_raw': 'Raw CRM extract, landed untouched from the source system.',
   'bronze.erp_customers_raw': 'Raw ERP extract, landed untouched from the source system.',
   'silver.silver_customers': 'Canonical, validated customer records that passed all metadata-driven rules.',
   'silver.exceptions_queue': 'Records that failed validation, awaiting steward remediation.',
+  'gold_prep.match_groups': 'Python match/merge step (scripts/generate_matches.py): union-find cluster assignment for every silver record, from exact + fuzzy embedding-similarity edges.',
+  'gold_prep.match_edges': 'Audit trail of every edge (exact email/phone, or fuzzy embedding similarity) that connected two records into the same match group.',
+  'gold_prep.match_review_candidates': 'Borderline fuzzy-match pairs (similarity between the review and auto-merge thresholds) awaiting a steward decision.',
   'gold.gold_customers': 'Survivorship-resolved golden master customer records (the Data Hub).',
-  'gold.gold_crosswalk': 'Preserves the relationship between golden records and their contributing source records.',
-  'gold.gold_match_candidates': 'Intermediate match-key computation used to group source records into one identity.',
+  'gold.gold_crosswalk': 'Preserves the relationship between golden records and their contributing source records, with a graduated match confidence score.',
+  'gold.gold_match_candidates': 'Silver records joined to their computed match_group_id (exact + fuzzy embedding-similarity clustering).',
+  'gold.gold_match_review_queue': 'Borderline fuzzy-match candidates presented to a data steward to confirm or reject.',
   'stewardship_app.remediation_log': 'Audit log of steward corrections and AI-suggested remediations.',
+  'stewardship_app.match_review_log': 'Audit log of steward confirm/reject decisions on borderline fuzzy-match candidates.',
 };
 
 let govGraph = null;        // { nodes: [...], edges: [...] }

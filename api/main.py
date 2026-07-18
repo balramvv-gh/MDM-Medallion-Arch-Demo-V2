@@ -13,6 +13,7 @@ from ai_remediation import suggest_remediation
 import lineage as lineage_mod
 import auth as auth_mod
 from reprocessing import reprocess_corrected_record
+from validation import validate_record
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -238,6 +239,25 @@ def resolve(exception_id: str, body: ResolveRequest, user: dict = Depends(auth_m
     record = to_records(df)[0]
     merged = {**record, **body.applied_fields}
 
+    # Re-check the corrected record against the same reject-severity rules that
+    # routed it here in the first place (column_rules.csv). Only a record that
+    # now genuinely passes validation is allowed to flow into reprocessing --
+    # otherwise it stays in the queue (still 'open') and the steward is told
+    # exactly what's still failing, instead of silently trusting the click.
+    still_failing = validate_record(merged)
+    if still_failing:
+        run_write("""
+            INSERT INTO stewardship.remediation_log
+                (log_id, exception_id, action, applied_fields, rationale, steward_note, suggestion_source)
+            VALUES (?, ?, 'steward_resolve_blocked', ?, ?, ?, 'steward')
+        """, [str(uuid.uuid4()), exception_id, json.dumps(body.applied_fields),
+              "Still failing: " + "; ".join(still_failing), body.steward_note])
+        raise HTTPException(422, detail={
+            "message": "This record still fails validation and was not resolved. "
+                       "It remains in the exception queue.",
+            "still_failing": still_failing,
+        })
+
     run_write("""
         INSERT OR REPLACE INTO stewardship.remediated_records
             (exception_id, source_system, source_record_id, first_name, last_name, email, phone,
@@ -291,6 +311,93 @@ def reject(exception_id: str, body: RejectRequest, user: dict = Depends(auth_mod
     """, [exception_id])
 
     return {"exception_id": exception_id, "status": "rejected"}
+
+
+# ---------------------------------------------------------------------------
+# (d) Match Review queue -- borderline fuzzy-match pairs from the gold layer's
+# embedding-similarity tier (scripts/generate_matches.py) that were not
+# auto-merged. A data steward confirms ("same customer, merge them") or
+# rejects ("coincidence, keep separate"). Same role gating as the exception
+# queue: dataSteward/dataOwner only, admin deliberately excluded.
+#
+# Known simplification: confirm/reject only writes the steward's decision.
+# It does NOT trigger real-time reprocessing -- re-clustering is a global
+# recompute (union-find over the whole silver set), not a local update like
+# a single corrected record, so it takes effect on the next full pipeline
+# rebuild (`python scripts/generate_matches.py && dbt run --select gold.*`,
+# or `python scripts/build_pipeline.py`). The response says so explicitly.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/stewardship/match-review")
+def get_match_review_queue(status: str = "pending", user: dict = Depends(auth_mod.require_steward_or_owner)):
+    df = run_query("""
+        SELECT q.*,
+               COALESCE(o.status, q.review_status) AS effective_status
+        FROM main_gold.gold_match_review_queue q
+        LEFT JOIN stewardship.match_review_overrides o
+          ON o.pair_id = q.pair_id
+        WHERE COALESCE(o.status, q.review_status) = ?
+        ORDER BY q.queued_ts
+    """, [status])
+    return {"status_filter": status, "count": len(df), "items": to_records(df)}
+
+
+@app.get("/api/v1/stewardship/match-review/{pair_id}")
+def get_match_review_item(pair_id: str, user: dict = Depends(auth_mod.require_steward_or_owner)):
+    df = run_query("SELECT * FROM main_gold.gold_match_review_queue WHERE pair_id = ?", [pair_id])
+    if df.empty:
+        raise HTTPException(404, "Match review candidate not found")
+    return to_records(df)[0]
+
+
+class MatchReviewDecisionRequest(BaseModel):
+    steward_note: Optional[str] = None
+
+
+@app.post("/api/v1/stewardship/match-review/{pair_id}/confirm")
+def confirm_match(pair_id: str, body: MatchReviewDecisionRequest, user: dict = Depends(auth_mod.require_steward_or_owner)):
+    df = run_query("SELECT * FROM main_gold.gold_match_review_queue WHERE pair_id = ?", [pair_id])
+    if df.empty:
+        raise HTTPException(404, "Match review candidate not found")
+
+    run_write("""
+        INSERT OR REPLACE INTO stewardship.match_review_overrides (pair_id, status, steward_note)
+        VALUES (?, 'confirmed', ?)
+    """, [pair_id, body.steward_note])
+    run_write("""
+        INSERT INTO stewardship.match_review_log (log_id, pair_id, action, steward_note)
+        VALUES (?, ?, 'confirmed', ?)
+    """, [str(uuid.uuid4()), pair_id, body.steward_note])
+
+    return {
+        "pair_id": pair_id,
+        "status": "confirmed",
+        "note": "Recorded. This pair will merge into a single golden record on the next "
+                "pipeline rebuild (python scripts/generate_matches.py && dbt run --select gold.*).",
+    }
+
+
+@app.post("/api/v1/stewardship/match-review/{pair_id}/reject")
+def reject_match(pair_id: str, body: MatchReviewDecisionRequest, user: dict = Depends(auth_mod.require_steward_or_owner)):
+    df = run_query("SELECT * FROM main_gold.gold_match_review_queue WHERE pair_id = ?", [pair_id])
+    if df.empty:
+        raise HTTPException(404, "Match review candidate not found")
+
+    run_write("""
+        INSERT OR REPLACE INTO stewardship.match_review_overrides (pair_id, status, steward_note)
+        VALUES (?, 'rejected', ?)
+    """, [pair_id, body.steward_note])
+    run_write("""
+        INSERT INTO stewardship.match_review_log (log_id, pair_id, action, steward_note)
+        VALUES (?, ?, 'rejected', ?)
+    """, [str(uuid.uuid4()), pair_id, body.steward_note])
+
+    return {
+        "pair_id": pair_id,
+        "status": "rejected",
+        "note": "Recorded. This pair will be permanently excluded from future matching runs "
+                "and will not resurface in the review queue.",
+    }
 
 
 @app.get("/health")

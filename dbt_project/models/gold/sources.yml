@@ -1,0 +1,17 @@
+version: 2
+
+sources:
+  - name: gold_prep
+    schema: gold_prep
+    description: >
+      Written by scripts/generate_matches.py (the embedding-based match/merge
+      step), which runs after silver and before this gold layer builds. Not a
+      dbt-built table -- same "Python loads, dbt treats it as a source"
+      pattern already used for the bronze layer (scripts/load_bronze.py).
+    tables:
+      - name: match_groups
+        description: One row per silver record, with the match_group_id its cluster was assigned.
+      - name: match_edges
+        description: Audit trail of every edge (exact or fuzzy) that connected two records into the same match group.
+      - name: match_review_candidates
+        description: Borderline fuzzy-match pairs (not auto-merged) awaiting a data steward's confirm/reject decision.

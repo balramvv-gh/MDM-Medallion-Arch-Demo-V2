@@ -205,7 +205,10 @@
     position: fixed; bottom: 24px; right: 24px;
     background: var(--panel-raised); border: 1px solid var(--border);
     padding: 12px 18px; border-radius: 8px; font-size: 13px;
-    display: none;
+    display: none; max-width: 420px;
+  }
+  .toast.toast-error {
+    border-color: var(--red); color: var(--red); background: rgba(224,90,90,0.1);
   }
 
   /* ---------- Login screen ---------- */
@@ -252,6 +255,56 @@
     padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
   }
   header .header-right { display: flex; align-items: center; gap: 20px; }
+
+  /* ---------- View tabs ---------- */
+  .view-tabs {
+    display: flex; gap: 4px; padding: 14px 40px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .view-tab {
+    background: transparent; border: none; color: var(--text-dim);
+    font-family: var(--sans); font-weight: 700; font-size: 13px;
+    padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent;
+    border-radius: 0;
+  }
+  .view-tab.active { color: var(--amber); border-bottom-color: var(--amber); }
+
+  /* ---------- Match review comparison ---------- */
+  .match-item .qscore {
+    font-family: var(--mono); font-size: 11px; color: var(--amber);
+    background: var(--amber-dim); display: inline-block; padding: 2px 6px;
+    border-radius: 3px; margin-top: 4px;
+  }
+  .compare-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    margin-bottom: 24px;
+  }
+  .compare-col { padding: 16px 18px; }
+  .compare-col:first-child { border-right: 1px solid var(--border); }
+  .compare-col .source-badge { margin-bottom: 14px; display: inline-block; }
+  .compare-row { padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .compare-row:last-child { border-bottom: none; }
+  .compare-row label {
+    display: block; font-family: var(--mono); font-size: 10px; color: var(--text-dim);
+    letter-spacing: 0.05em; margin-bottom: 3px;
+  }
+  .compare-row .val { font-size: 14px; }
+  .compare-row .val.diff { color: var(--amber); font-weight: 600; }
+  .similarity-banner {
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 16px; margin-bottom: 20px;
+  }
+  .similarity-banner .label { font-family: var(--mono); font-size: 11px; color: var(--text-dim); letter-spacing: 0.05em; }
+  .similarity-banner .score { font-family: var(--mono); font-size: 20px; color: var(--amber); font-weight: 700; }
+  .btn-confirm { background: var(--green); color: #0a1710; }
+  .status-pill {
+    font-family: var(--mono); font-size: 10px; padding: 2px 8px; border-radius: 4px;
+    display: inline-block; margin-left: 8px;
+  }
+  .status-pill.confirmed { color: var(--green); background: rgba(91,201,138,0.12); }
+  .status-pill.rejected { color: var(--red); background: rgba(224,90,90,0.12); }
 </style>
 </head>
 <body>
@@ -287,7 +340,7 @@
     <span class="tag">MDM DEMO</span>
   </div>
   <div class="header-right">
-    <div class="queue-count">Open exceptions: <b id="queueCount">--</b></div>
+    <div class="queue-count"><span id="queueCountLabel">Open exceptions</span>: <b id="queueCount">--</b></div>
     <div class="user-chip">
       <span id="userFullName"></span>
       <span class="role-badge" id="userRoleBadge"></span>
@@ -295,6 +348,11 @@
     </div>
   </div>
 </header>
+
+<div class="view-tabs">
+  <button class="view-tab active" id="tabExceptions" onclick="switchView('exceptions')">Exception Queue</button>
+  <button class="view-tab" id="tabMatchReview" onclick="switchView('matchReview')">Match Review</button>
+</div>
 
 <main>
   <div class="queue-panel" id="queuePanel">
@@ -318,6 +376,8 @@ function roleLabel(role) { return ROLE_LABELS[role] || role; }
 let session = null;           // {token, user}
 let currentItem = null;
 let editedFields = {};
+let currentView = 'exceptions';   // 'exceptions' | 'matchReview'
+let currentMatchItem = null;
 
 function authHeaders() {
   return { 'Authorization': `Bearer ${session.token}`, 'Content-Type': 'application/json' };
@@ -398,7 +458,25 @@ async function doLogout() {
   showScreen('loginScreen');
 }
 
+function switchView(view) {
+  currentView = view;
+  document.getElementById('tabExceptions').classList.toggle('active', view === 'exceptions');
+  document.getElementById('tabMatchReview').classList.toggle('active', view === 'matchReview');
+  document.getElementById('queueCountLabel').textContent = view === 'exceptions' ? 'Open exceptions' : 'Pending matches';
+  currentItem = null;
+  currentMatchItem = null;
+  document.getElementById('detailPanel').innerHTML = view === 'exceptions'
+    ? '<div class="empty-state">Select a record from the queue to begin remediation.</div>'
+    : '<div class="empty-state">Select a candidate pair to review.</div>';
+  loadQueue();
+}
+
 async function loadQueue() {
+  if (currentView === 'exceptions') return loadExceptionQueue();
+  return loadMatchReviewQueue();
+}
+
+async function loadExceptionQueue() {
   const res = await fetch(`${API}/stewardship/queue?status=open`, { headers: authHeaders() });
   if (!res.ok) return;
   const data = await res.json();
@@ -413,6 +491,25 @@ async function loadQueue() {
       <div class="qid">${item.source_system} · ${item.source_record_id}</div>
       <div class="qname">${item.first_name || '(no first name)'} ${item.last_name || '(no last name)'}</div>
       ${item.reject_reasons.map(r => `<span class="qreason">${r}</span>`).join(' ')}
+    </div>
+  `).join('');
+}
+
+async function loadMatchReviewQueue() {
+  const res = await fetch(`${API}/stewardship/match-review?status=pending`, { headers: authHeaders() });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('queueCount').textContent = data.count;
+  const panel = document.getElementById('queuePanel');
+  if (data.items.length === 0) {
+    panel.innerHTML = '<div class="empty-state">No borderline matches waiting on review.</div>';
+    return;
+  }
+  panel.innerHTML = data.items.map(item => `
+    <div class="queue-item match-item" data-id="${item.pair_id}" onclick="selectMatchItem('${item.pair_id}')">
+      <div class="qid">${item.source_system_a} · ${item.source_record_id_a}  ⇄  ${item.source_system_b} · ${item.source_record_id_b}</div>
+      <div class="qname">${item.first_name_a || '—'} ${item.last_name_a || '—'}  vs.  ${item.first_name_b || '—'} ${item.last_name_b || '—'}</div>
+      <span class="qscore">similarity ${item.similarity_score.toFixed(2)}</span>
     </div>
   `).join('');
 }
@@ -492,11 +589,14 @@ async function getSuggestion() {
 }
 
 async function resolveItem() {
+  const btn = document.querySelector('.btn-resolve');
+  btn.disabled = true;
   const res = await fetch(`${API}/stewardship/queue/${currentItem.exception_id}/resolve`, {
     method: 'POST',
     headers: authHeaders(),
     body: JSON.stringify({ applied_fields: editedFields, steward_note: 'Resolved via stewardship console' }),
   });
+  btn.disabled = false;
   if (res.ok) {
     const data = await res.json();
     const rp = data.reprocessing;
@@ -510,7 +610,26 @@ async function resolveItem() {
     currentItem = null;
     document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select a record from the queue to begin remediation.</div>';
     loadQueue();
+    return;
   }
+
+  // Validation gate rejected the resolve (still fails one or more rules):
+  // the record stays right where it is, in the queue and still selected --
+  // don't clear the detail panel or reload, just alert the steward.
+  let msg = 'Could not resolve this record.';
+  try {
+    const err = await res.json();
+    const detail = err.detail;
+    if (detail && typeof detail === 'object') {
+      msg = detail.message;
+      if (detail.still_failing && detail.still_failing.length) {
+        msg += ' Still failing: ' + detail.still_failing.join('; ') + '.';
+      }
+    } else if (typeof detail === 'string') {
+      msg = detail;
+    }
+  } catch (e) { /* fall through to generic message */ }
+  showToast(msg, 'error');
 }
 
 async function rejectItem() {
@@ -527,11 +646,100 @@ async function rejectItem() {
   }
 }
 
-function showToast(msg) {
+const COMPARE_FIELD_LABELS = [
+  ['first_name', 'First name'], ['last_name', 'Last name'], ['email', 'Email'],
+  ['phone', 'Phone'], ['address_line1', 'Address'], ['city', 'City'],
+  ['state_code', 'State'], ['postal_code', 'Postal code'],
+];
+
+async function selectMatchItem(pairId) {
+  document.querySelectorAll('.queue-item').forEach(el => el.classList.toggle('active', el.dataset.id === pairId));
+  const res = await fetch(`${API}/stewardship/match-review/${pairId}`, { headers: authHeaders() });
+  currentMatchItem = await res.json();
+  renderMatchDetail();
+}
+
+function renderMatchDetail() {
+  const item = currentMatchItem;
+  const panel = document.getElementById('detailPanel');
+
+  const rows = COMPARE_FIELD_LABELS.map(([key, label]) => {
+    const valA = item[`${key}_a`] ?? '';
+    const valB = item[`${key}_b`] ?? '';
+    const diff = String(valA).toLowerCase() !== String(valB).toLowerCase();
+    return { key, label, valA, valB, diff };
+  });
+
+  panel.innerHTML = `
+    <div class="record-header">
+      <h2>Possible duplicate</h2>
+      <span class="source-badge">pair ${item.pair_id.slice(0, 8)}…</span>
+    </div>
+    <div class="similarity-banner">
+      <span class="label">EMBEDDING SIMILARITY (name + address, blocked on ${item.blocking_key})</span>
+      <span class="score">${item.similarity_score.toFixed(3)}</span>
+    </div>
+    <div class="compare-grid">
+      <div class="compare-col">
+        <span class="source-badge">${item.source_system_a} · ${item.source_record_id_a}</span>
+        ${rows.map(r => `
+          <div class="compare-row">
+            <label>${r.label}</label>
+            <div class="val ${r.diff ? 'diff' : ''}">${r.valA || '—'}</div>
+          </div>
+        `).join('')}
+      </div>
+      <div class="compare-col">
+        <span class="source-badge">${item.source_system_b} · ${item.source_record_id_b}</span>
+        ${rows.map(r => `
+          <div class="compare-row">
+            <label>${r.label}</label>
+            <div class="val ${r.diff ? 'diff' : ''}">${r.valB || '—'}</div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn-confirm" onclick="confirmMatch()">Confirm — same customer, merge</button>
+      <button class="btn-reject" onclick="rejectMatch()">Reject — not a duplicate</button>
+    </div>
+  `;
+}
+
+async function confirmMatch() {
+  const res = await fetch(`${API}/stewardship/match-review/${currentMatchItem.pair_id}/confirm`, {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({ steward_note: 'Confirmed via stewardship console' }),
+  });
+  if (res.ok) {
+    const data = await res.json();
+    showToast(data.note || 'Match confirmed.');
+    currentMatchItem = null;
+    document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select a candidate pair to review.</div>';
+    loadMatchReviewQueue();
+  }
+}
+
+async function rejectMatch() {
+  const res = await fetch(`${API}/stewardship/match-review/${currentMatchItem.pair_id}/reject`, {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({ steward_note: 'Rejected via stewardship console' }),
+  });
+  if (res.ok) {
+    const data = await res.json();
+    showToast(data.note || 'Match rejected.');
+    currentMatchItem = null;
+    document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select a candidate pair to review.</div>';
+    loadMatchReviewQueue();
+  }
+}
+
+function showToast(msg, kind) {
   const t = document.getElementById('toast');
   t.textContent = msg;
+  t.classList.toggle('toast-error', kind === 'error');
   t.style.display = 'block';
-  setTimeout(() => t.style.display = 'none', 3000);
+  setTimeout(() => t.style.display = 'none', kind === 'error' ? 6000 : 3000);
 }
 
 tryRestoreSession();

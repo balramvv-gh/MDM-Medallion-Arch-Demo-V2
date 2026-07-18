@@ -15,6 +15,7 @@ def get_con():
     if _con is None:
         _con = duckdb.connect(DB_PATH)
         _ensure_stewardship_tables(_con)
+        _ensure_match_review_tables(_con)
         _ensure_auth_tables(_con)
     return _con
 
@@ -86,6 +87,32 @@ def _ensure_stewardship_tables(con):
             postal_code VARCHAR,
             country_code VARCHAR,
             resolved_ts TIMESTAMP DEFAULT current_timestamp
+        );
+    """)
+
+
+def _ensure_match_review_tables(con):
+    """Live status overlay for gold_match_review_queue (the dbt-built static
+    snapshot of borderline fuzzy-match pairs) -- same pattern as
+    exception_status_overrides for exceptions_queue. Also created by
+    scripts/generate_matches.py; whichever of the two runs first wins, both
+    definitions must stay identical."""
+    con.execute("CREATE SCHEMA IF NOT EXISTS stewardship;")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS stewardship.match_review_overrides (
+            pair_id VARCHAR PRIMARY KEY,
+            status VARCHAR,             -- 'confirmed' | 'rejected'
+            steward_note VARCHAR,
+            updated_ts TIMESTAMP DEFAULT current_timestamp
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS stewardship.match_review_log (
+            log_id VARCHAR,
+            pair_id VARCHAR,
+            action VARCHAR,             -- 'confirmed' | 'rejected'
+            steward_note VARCHAR,
+            created_ts TIMESTAMP DEFAULT current_timestamp
         );
     """)
 

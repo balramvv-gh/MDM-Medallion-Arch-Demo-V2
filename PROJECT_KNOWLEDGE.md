@@ -21,10 +21,19 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   **metadata-driven**: rules live in `dbt_project/seeds/column_rules.csv` (rule_id, source
   column, rule_type, severity), not hardcoded in pipeline code. Records failing validation
   route to an exception queue instead of silver.
-- **Gold (Data Hub)** — deterministic match/merge (exact match on normalized email OR
-  phone) across sources, record-level survivorship (most-recently-modified source wins,
-  CRM preferred as tiebreak), and a **crosswalk table** preserving the relationship between
-  every golden record and its contributing source records with match confidence scores.
+- **Gold (Data Hub)** — hybrid match/merge across sources: tier 1 is deterministic exact
+  match on normalized email OR phone (confidence 1.00); tier 2 is an embedding-similarity
+  fuzzy match (TF-IDF character n-gram cosine similarity over name/address text, blocked
+  by state_code) that catches near-duplicates tier 1 misses. High-confidence fuzzy matches
+  auto-merge with their similarity score as confidence; borderline ones surface in a
+  **Match Review queue** for a data steward to confirm or reject rather than auto-merging.
+  Computed in `scripts/generate_matches.py`, which runs as a Python step between silver
+  and gold (dbt-duckdb can't do the embedding math in SQL) and writes to a `gold_prep`
+  schema that the gold dbt models consume as a source — same "Python loads, dbt treats it
+  as a source" pattern already used for bronze. Record-level survivorship
+  (most-recently-modified source wins, CRM preferred as tiebreak) and a **crosswalk table**
+  preserve the relationship between every golden record and its contributing source
+  records, with a graduated match confidence score.
 
 ## Tech stack
 
@@ -33,6 +42,12 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   has production experience with) because Talend's MDM Server product and Open Studio are
   both end-of-life/discontinued as of 2024, and Databricks/dbt-style lakehouse patterns are
   what current job postings ask for.
+- **scikit-learn** (TF-IDF + cosine similarity) for the fuzzy-matching tier — chosen over
+  a neural sentence-embedding model (e.g. sentence-transformers) to keep the demo's setup
+  fast and fully offline (no model download, no torch, no GPU); a defensible "real
+  embedding-similarity technique" story for an interview without the install weight.
+- **Faker** generates the ~100-row-per-source synthetic population (see Key data model
+  notes below for how single-source, exact-duplicate, and fuzzy-duplicate cases are seeded).
 - **FastAPI** backend for all apps and the REST API, with bcrypt-hashed password auth
   (from-scratch bearer-token sessions, 8-hour expiry).
 - Plain HTML/JS frontends (no build step, no Node.js needed) for both apps.
@@ -44,17 +59,30 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 
 ## Applications
 
-1. **Data Stewardship console** (`/app/`) — reviews the exception queue, gets an
-   AI-assisted remediation suggestion (real Claude API call via `ANTHROPIC_API_KEY`, with a
-   transparent heuristic fallback when no key is set — every suggestion response includes
-   `source: "ai"` or `"heuristic_fallback"`), and approves/rejects corrections. **Approving
-   a correction triggers real-time reprocessing**: the corrected record is upserted into
-   silver, matched against the current gold set, and survivorship is re-run to either update
-   the matched golden record or create a new one. This mirrors the batch dbt logic so both
-   paths stay consistent, though golden ID numbering can diverge between them (documented
-   limitation).
+1. **Data Stewardship console** (`/app/`) — two tabs.
+   - **Exception Queue** — reviews the exception queue, gets an
+     AI-assisted remediation suggestion (real Claude API call via `ANTHROPIC_API_KEY`, with a
+     transparent heuristic fallback when no key is set — every suggestion response includes
+     `source: "ai"` or `"heuristic_fallback"`), and approves/rejects corrections. **Approving
+     a correction triggers real-time reprocessing**: the corrected record is upserted into
+     silver, matched (exact tier only, see known simplifications) against the current gold set,
+     and survivorship is re-run to either update the matched golden record or create a new one.
+     This mirrors the batch dbt logic so both paths stay consistent, though golden ID numbering
+     can diverge between them (documented limitation).
+   - **Match Review** — borderline fuzzy-match candidates from the gold layer's
+     embedding-similarity tier (similarity between the review and auto-merge thresholds),
+     shown side by side, for the steward to confirm or reject. Unlike exception resolution,
+     confirm/reject does NOT reprocess in real time (re-clustering is a global union-find
+     recompute, not a local update) — it writes to `stewardship.match_review_overrides` and
+     takes effect on the next `python scripts/generate_matches.py && dbt run --select gold.*`.
 
-2. **MDM Data Hub Portal** (`/portal/`) — login-gated. Has:
+2. **MDM Data Hub Portal** (`/portal/`) — login-gated, SSO'd with the Stewardship
+   app. Roles are `admin` / `dataSteward` / `dataOwner` / `businessUser`; gold
+   access is `read_write` / `read` / `none`. `admin` is a distinct governance
+   function (user administration only) and is deliberately **not** a superset of
+   stewardship rights — only `dataSteward`/`dataOwner` can reach the Stewardship
+   console or its API endpoints (enforced both server-side in `api/auth.py` and
+   independently in the Stewardship frontend). Has:
    - **Browse Customers** — searchable/paginated gold-layer browser with live (debounced)
      search-as-you-type, click-through detail view with the source crosswalk, inline edit
      if the user's account has `read_write` gold access.
@@ -65,8 +93,8 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
      Clicking a gold node adds a Golden ID lookup tool. This replaced an earlier two-mode
      "pick a column, see a static chain" version entirely, by design.
    - **Administration → User Administration** — admin-only. Create/edit/deactivate users,
-     assign role (`admin`/`steward`/`viewer`) and gold access (`read_write`/`read`/`none`),
-     reset passwords. The seed admin account is `mdm_admin`, created via
+     assign role (`admin`/`dataSteward`/`dataOwner`/`businessUser`) and gold access
+     (`read_write`/`read`/`none`), reset passwords. The seed admin account is `mdm_admin`, created via
      `scripts/create_admin_user.py`, which prints a one-time random password to the
      terminal — never stored in plaintext, never baked into the shipped zip.
 
@@ -81,21 +109,45 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 - `dbt_project/seeds/lineage_edges.csv` — column-level lineage metadata (from_layer/table/
   column → to_layer/table/column, transform_rule_id, description). Powers both the
   Data Governance network diagram and the `/api/v1/lineage/*` endpoints. Note: wildcard
-  nodes (e.g. `gold.gold_match_candidates.*`) must be explicitly linked to specific match-
-  key columns or impact-analysis chains silently break — this bit us once already (fixed
-  in edges E018/E019).
+  nodes (e.g. `gold.gold_match_candidates.*`) must be explicitly linked to specific
+  columns or impact-analysis chains silently break — this bit us once already, and again
+  when the match/merge step moved into `gold_prep` (matching layer is now `gold_prep`,
+  edges E013/E014/E018-E026 cover it; re-verify with `/api/v1/lineage/impact` and
+  `/trace` after touching this file, don't just eyeball it).
+- `gold_prep.match_groups` / `match_edges` / `match_review_candidates` — written by
+  `scripts/generate_matches.py` (not dbt-built), same "Python loads, dbt treats it as a
+  source" pattern as bronze. `match_edges` is the audit trail dbt joins to compute
+  `gold_crosswalk.match_confidence_score`.
 - `auth.users` / `auth.sessions` — bcrypt password hashes, bearer tokens, 8hr TTL.
 - `stewardship.remediation_log` / `remediated_records` / `exception_status_overrides` —
   audit trail and status tracking layered on top of the dbt-built `exceptions_queue` table
   (which itself is a static point-in-time snapshot; live status lives in the overrides
   table, not the snapshot).
+- `stewardship.match_review_overrides` / `match_review_log` — same live-status-overlay
+  pattern, for `gold_match_review_queue` instead of `exceptions_queue`. A 'confirmed'
+  override is honored by `generate_matches.py` as a forced union-find merge on the next
+  run; a 'rejected' override permanently excludes that pair from ever resurfacing.
 
 ## Known simplifications (documented on purpose, not oversights)
 
-- Matching is deterministic (exact email/phone match), not fuzzy/probabilistic.
+- Fuzzy matching only runs in the batch pipeline (`scripts/generate_matches.py`).
+  Real-time reprocessing (steward resolves an exception → immediate re-match) still only
+  does exact email/phone matching -- fitting a TF-IDF vectorizer per API request was judged
+  not worth the latency for a demo-scoped feature. A confirmed/rejected Match Review
+  decision similarly only takes effect on the next batch rebuild, not instantly.
+- The fuzzy tier is TF-IDF character n-gram cosine similarity, not a neural sentence
+  embedding -- a deliberate lightweight choice (see Tech stack). Thresholds (TAU_HIGH=0.80
+  auto-merge, TAU_LOW=0.35 review floor) were calibrated empirically against this project's
+  synthetic data generator's 12 seeded fuzzy-duplicate pairs vs. every same-state
+  non-duplicate pair; re-calibrate if the generator's population changes materially.
 - Survivorship is record-level (whole record from one winning source), not attribute-level.
-- Steward corrections skip re-validation against the metadata rules — steward approval is
-  treated as authoritative (human-in-the-loop override).
+- Steward corrections ARE re-validated against the reject-severity metadata rules
+  (`api/validation.py`, mirroring `column_rules.csv`) before reprocessing runs — a
+  correction that still fails validation is rejected with an alert and the record
+  stays in the queue (status remains `open`). Only a genuinely valid correction is
+  treated as authoritative and flows into match/merge; correct-severity
+  standardization rules (proper-casing, phone formatting) are not re-checked, since
+  they don't gate silver eligibility in the batch pipeline either.
 - Real-time reprocessing's match step compares against each golden record's *current*
   survivor values, not every historical non-survivor source in that group.
 - New golden IDs from real-time reprocessing increment the current max, which can diverge
@@ -106,12 +158,15 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 ## Repo structure
 
 ```
-data/                  synthetic CRM+ERP source data generator
-scripts/                load_bronze.py, create_admin_user.py, reset_admin_password.py
-dbt_project/            seeds (rules/reference/lineage metadata), models (silver, gold)
+data/                  synthetic CRM+ERP source data generator (Faker-based, ~100 rows/source)
+scripts/                load_bronze.py, generate_matches.py (fuzzy match/merge, Python step
+                        between silver and gold), build_pipeline.py (runs the 4-stage build),
+                        create_admin_user.py, reset_admin_password.py
+dbt_project/            seeds (rules/reference/lineage metadata), models (silver, gold);
+                        gold reads scripts/generate_matches.py's output via the gold_prep source
 api/                    FastAPI app: main.py, db.py, auth.py, reprocessing.py,
                         lineage.py, ai_remediation.py
-stewardship_app/frontend/   exception queue console (plain HTML/JS)
+stewardship_app/frontend/   exception queue + match review console (plain HTML/JS)
 portal_app/frontend/        login-gated portal: browse, governance graph, admin (plain HTML/JS)
 requirements.txt        pinned deps (duckdb==1.5.4 -- NOT the same version number as the
                         dbt-duckdb adapter, a mistake made once already, worth double-checking)

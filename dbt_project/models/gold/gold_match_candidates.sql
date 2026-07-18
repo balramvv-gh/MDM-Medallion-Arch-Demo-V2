@@ -1,25 +1,24 @@
--- Match strategy (demo-scope, deterministic): two records are considered the same
--- customer if they share the same normalized email OR the same normalized phone.
--- A production system would add fuzzy name/address matching and probabilistic scoring;
--- this is intentionally simple so the survivorship/crosswalk logic stays legible.
+-- Match strategy: hybrid deterministic + embedding-similarity, computed by
+-- scripts/generate_matches.py (which must run after silver_customers and
+-- before this model -- see that script's docstring for the full algorithm
+-- and README.md for the build sequence). Tier 1 is exact match on normalized
+-- email OR phone; tier 2 is TF-IDF cosine-similarity over name/address text,
+-- clustered via union-find. This model just attaches the match_group_id that
+-- step computed to each silver record; it stays its own model (rather than
+-- inlining into gold_customers) so lineage/impact analysis can point at "the
+-- matching step" as a distinct node, same as before.
 with silver as (
     select * from {{ ref('silver_customers') }}
 ),
 
-match_keys as (
-    select
-        *,
-        lower(trim(email)) as match_email,
-        regexp_replace(coalesce(phone, ''), '[^0-9]', '', 'g') as match_phone
-    from silver
-),
-
--- assign a match_group_id: union records sharing an email or phone key
 groups as (
-    select
-        *,
-        dense_rank() over (order by coalesce(nullif(match_email, ''), match_phone)) as match_group_id
-    from match_keys
+    select * from {{ source('gold_prep', 'match_groups') }}
 )
 
-select * from groups
+select
+    s.*,
+    g.match_group_id
+from silver s
+join groups g
+  on g.source_system = s.source_system
+ and g.source_record_id = s.source_record_id

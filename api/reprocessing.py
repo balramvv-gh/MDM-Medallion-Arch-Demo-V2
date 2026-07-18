@@ -1,9 +1,15 @@
 """
 Real-time reprocessing path for records corrected by a data steward.
 
-When a steward resolves an exception, this module:
+This module is only ever invoked by api/main.py's `resolve()` endpoint AFTER
+the corrected record has already passed re-validation (see api/validation.py)
+against the same reject-severity rules that routed it to the exception queue
+in the first place. By the time `reprocess_corrected_record` runs, the record
+is confirmed valid -- it is not this module's job to re-check that.
+
+When a steward's correction passes re-validation, this module:
   1. Upserts the corrected record into the silver layer (main_silver.silver_customers) --
-     it is now treated as canonical, on the strength of the steward's approval.
+     it is now treated as canonical, on the strength of having passed re-validation.
   2. Matches the corrected record against the CURRENT set of golden records, using the
      same deterministic strategy as the batch dbt gold_match_candidates model
      (normalized email OR normalized phone).
@@ -15,9 +21,12 @@ When a steward resolves an exception, this module:
          sole (and therefore survivor) source.
 
 Design notes / known simplifications (consistent with the rest of this demo):
-  - The steward's correction is NOT re-run through the automated validation rules --
-    a steward's sign-off is treated as authoritative. (They already saw the original
-    reject reasons; this models human-in-the-loop override, a standard MDM pattern.)
+  - Re-validation (api/validation.py) only re-checks the reject-severity rules
+    from column_rules.csv (the ones that determine silver eligibility), not the
+    correct-severity standardization rules (proper-casing, phone formatting) --
+    those are cosmetic and don't gate silver eligibility in the batch pipeline
+    either. A steward's sign-off on a now-valid record is still what makes the
+    correction authoritative; the record just has to actually be valid first.
   - The corrected record's "modified" timestamp is stamped as the moment of
     correction. Combined with the recency-wins survivorship rule, this means a fresh
     steward correction will typically become the new survivor -- which is usually the

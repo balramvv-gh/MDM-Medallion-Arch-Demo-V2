@@ -3,6 +3,8 @@ dbt-duckdb==1.10.1
 duckdb==1.5.4
 pandas
 numpy
+scikit-learn
+faker
 fastapi
 uvicorn[standard]
 anthropic
