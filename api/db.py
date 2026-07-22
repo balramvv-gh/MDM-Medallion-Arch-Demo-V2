@@ -17,6 +17,7 @@ def get_con():
         _ensure_stewardship_tables(_con)
         _ensure_match_review_tables(_con)
         _ensure_auth_tables(_con)
+        _ensure_audit_tables(_con)
     return _con
 
 
@@ -113,6 +114,47 @@ def _ensure_match_review_tables(con):
             action VARCHAR,             -- 'confirmed' | 'rejected'
             steward_note VARCHAR,
             created_ts TIMESTAMP DEFAULT current_timestamp
+        );
+    """)
+
+
+def _ensure_audit_tables(con):
+    """Append-only audit trail for the gold layer (creation, edits -- manual or
+    systemic, and logical deletes). No function anywhere in this codebase issues
+    an UPDATE or DELETE against audit.audit_trail, and there is no API endpoint
+    that could -- that omission is the enforcement mechanism (DuckDB has no
+    per-table grants to lean on here, so "not editable by any role" is an
+    application-level guarantee, consistent with how gold_access read/read_write
+    is already enforced in api/auth.py rather than via DB permissions).
+
+    gold_customers_snapshot lives in this same schema specifically so it survives
+    every `dbt run`'s CREATE OR REPLACE of main_gold.gold_customers -- it's how
+    scripts/audit_pipeline_diff.py detects what changed across a batch rebuild."""
+    con.execute("CREATE SCHEMA IF NOT EXISTS audit;")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS audit.audit_trail (
+            audit_id VARCHAR PRIMARY KEY,
+            golden_id VARCHAR,
+            change_batch_id VARCHAR,     -- groups the field-level rows from one logical operation
+            event_ts TIMESTAMP,
+            event_type VARCHAR,          -- 'created' | 'updated' | 'logically_deleted'
+            event_source VARCHAR,        -- 'pipeline_batch' | 'portal_manual_edit' | 'steward_reprocessing'
+            changed_by VARCHAR,          -- user_id, or 'system:dbt_pipeline'
+            changed_by_label VARCHAR,    -- display name shown in the UI
+            field_name VARCHAR,          -- null for record-level events (logical delete)
+            old_value VARCHAR,
+            new_value VARCHAR,
+            change_reason VARCHAR,
+            related_exception_id VARCHAR
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS audit.gold_customers_snapshot (
+            golden_id VARCHAR PRIMARY KEY,
+            first_name VARCHAR, last_name VARCHAR, email VARCHAR, phone VARCHAR,
+            address_line1 VARCHAR, address_line2 VARCHAR, city VARCHAR, state_code VARCHAR,
+            postal_code VARCHAR, country_code VARCHAR, source_system_count INTEGER,
+            survivor_source_system VARCHAR, survivor_source_record_id VARCHAR
         );
     """)
 

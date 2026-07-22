@@ -47,6 +47,7 @@ from datetime import datetime
 import pandas as pd
 
 from db import run_query, run_write
+import audit as audit_mod
 
 
 def _normalize_email(email):
@@ -67,9 +68,12 @@ def _epoch(dt):
     return ts.timestamp()
 
 
-def reprocess_corrected_record(record: dict) -> dict:
+def reprocess_corrected_record(record: dict, actor: dict = None) -> dict:
     """Entry point called after a steward resolves an exception. `record` must contain
-    source_system, source_record_id, and the (possibly corrected) customer fields."""
+    source_system, source_record_id, and the (possibly corrected) customer fields.
+    `actor` is the authenticated steward/owner (api/auth.py's _public_user shape) --
+    used to attribute the resulting audit trail entry; falls back to a generic
+    'system' attribution if not supplied."""
     source_system = record["source_system"]
     source_record_id = record["source_record_id"]
     now = datetime.utcnow()
@@ -103,12 +107,12 @@ def reprocess_corrected_record(record: dict) -> dict:
     # --- (c) Survivorship: update existing golden record, or create a new one --
     if not matched.empty:
         golden_id = matched.iloc[0]["golden_id"]
-        return _update_existing_golden_record(golden_id, source_system, source_record_id, record, now)
+        return _update_existing_golden_record(golden_id, source_system, source_record_id, record, now, actor)
     else:
-        return _create_new_golden_record(source_system, source_record_id, record, now)
+        return _create_new_golden_record(source_system, source_record_id, record, now, actor)
 
 
-def _create_new_golden_record(source_system, source_record_id, record, now) -> dict:
+def _create_new_golden_record(source_system, source_record_id, record, now, actor=None) -> dict:
     golden_id = _next_golden_id()
 
     run_write("""
@@ -128,6 +132,15 @@ def _create_new_golden_record(source_system, source_record_id, record, now) -> d
         VALUES (?, ?, ?, 1.00, true, ?)
     """, [golden_id, source_system, source_record_id, now])
 
+    new_row = run_query("SELECT * FROM main_gold.gold_customers WHERE golden_id = ?", [golden_id]).iloc[0].to_dict()
+    audit_mod.log_creation(
+        golden_id, new_row, event_source="steward_reprocessing",
+        changed_by=(actor or {}).get("user_id", "system:steward_reprocessing"),
+        changed_by_label=(actor or {}).get("full_name") or (actor or {}).get("username", "steward"),
+        change_reason=f"Created via real-time reprocessing of exception {record.get('exception_id', 'unknown')}",
+        related_exception_id=record.get("exception_id"), event_ts=now,
+    )
+
     return {
         "action": "created_new_golden_record",
         "golden_id": golden_id,
@@ -136,7 +149,10 @@ def _create_new_golden_record(source_system, source_record_id, record, now) -> d
     }
 
 
-def _update_existing_golden_record(golden_id, source_system, source_record_id, record, now) -> dict:
+def _update_existing_golden_record(golden_id, source_system, source_record_id, record, now, actor=None) -> dict:
+    old_row_df = run_query("SELECT * FROM main_gold.gold_customers WHERE golden_id = ?", [golden_id])
+    old_record = old_row_df.iloc[0].to_dict() if not old_row_df.empty else {}
+
     # Idempotency: drop any stale crosswalk row for this exact source before recomputing.
     run_write(
         "DELETE FROM main_gold.gold_crosswalk WHERE golden_id = ? AND source_system = ? AND source_record_id = ?",
@@ -207,6 +223,21 @@ def _update_existing_golden_record(golden_id, source_system, source_record_id, r
 
     new_source_is_survivor = (survivor["source_system"] == source_system
                                and survivor["source_record_id"] == source_record_id)
+
+    new_row = run_query("SELECT * FROM main_gold.gold_customers WHERE golden_id = ?", [golden_id]).iloc[0].to_dict()
+    audit_mod.log_update(
+        golden_id, old_record=old_record, new_record=new_row,
+        event_source="steward_reprocessing",
+        changed_by=(actor or {}).get("user_id", "system:steward_reprocessing"),
+        changed_by_label=(actor or {}).get("full_name") or (actor or {}).get("username", "steward"),
+        change_reason=(
+            f"Survivorship recomputed via real-time reprocessing of exception "
+            f"{record.get('exception_id', 'unknown')} (new survivor: "
+            f"{survivor['source_system']}:{survivor['source_record_id']})"
+        ),
+        related_exception_id=record.get("exception_id"), event_ts=now,
+    )
+
     return {
         "action": "updated_existing_golden_record",
         "golden_id": golden_id,

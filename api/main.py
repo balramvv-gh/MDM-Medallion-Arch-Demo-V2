@@ -12,6 +12,7 @@ from db import run_query, run_write, to_records
 from ai_remediation import suggest_remediation
 import lineage as lineage_mod
 import auth as auth_mod
+import audit as audit_mod
 from reprocessing import reprocess_corrected_record
 from validation import validate_record
 
@@ -104,6 +105,29 @@ def get_customer_sources(golden_id: str, user: dict = Depends(auth_mod.require_g
     return {"golden_id": golden_id, "sources": to_records(df)}
 
 
+@app.get("/api/v1/customers/{golden_id}/audit-trail")
+def get_customer_audit_trail(golden_id: str, user: dict = Depends(auth_mod.require_gold_read)):
+    """Read-only, append-only history of every creation, edit (manual or
+    systemic), and logical delete recorded for one golden record. Gated the
+    same way as viewing the record itself (any gold_access of 'read' or
+    'read_write') -- there is no corresponding write/delete endpoint, by design.
+    Falls back to a reconstruction from the audit log itself if the record has
+    been logically deleted (no longer present in main_gold.gold_customers)."""
+    events = audit_mod.get_audit_trail(golden_id)
+    if not events:
+        raise HTTPException(404, f"No audit history found for {golden_id}")
+
+    current_df = run_query("SELECT * FROM main_gold.gold_customers WHERE golden_id = ?", [golden_id])
+    if not current_df.empty:
+        current = to_records(current_df)[0]
+        is_active = True
+    else:
+        current = audit_mod.reconstruct_last_known_state(golden_id)
+        is_active = False
+
+    return {"golden_id": golden_id, "is_active": is_active, "current": current, "events": events}
+
+
 class CustomerUpdateRequest(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -133,6 +157,14 @@ def update_customer(golden_id: str, body: CustomerUpdateRequest, user: dict = De
         list(updates.values()) + [golden_id],
     )
     updated = run_query("SELECT * FROM main_gold.gold_customers WHERE golden_id = ?", [golden_id])
+
+    audit_mod.log_update(
+        golden_id, old_record=to_records(df)[0], new_record=to_records(updated)[0],
+        event_source="portal_manual_edit",
+        changed_by=user["user_id"], changed_by_label=user.get("full_name") or user.get("username", "unknown"),
+        change_reason="Manual edit via MDM Data Hub Portal",
+    )
+
     return to_records(updated)[0]
 
 
@@ -279,7 +311,7 @@ def resolve(exception_id: str, body: ResolveRequest, user: dict = Depends(auth_m
         VALUES (?, 'resolved')
     """, [exception_id])
 
-    reprocess_result = reprocess_corrected_record(merged)
+    reprocess_result = reprocess_corrected_record(merged, actor=user)
 
     return {
         "exception_id": exception_id,

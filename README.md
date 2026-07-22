@@ -47,6 +47,15 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
   distinct governance function (user administration) and is deliberately **not** a
   superset of stewardship rights — an admin account cannot access the Data
   Stewardship console or its API endpoints; only `dataSteward` / `dataOwner` can.
+- **Audit Trail** (`/portal/`, on any customer's detail view) — a read-only, append-only
+  history of every golden record: its creation, every edit (manual portal edit, steward
+  real-time reprocessing, or batch pipeline recompute/survivorship change), and logical
+  deletes (a golden_id no longer produced by a pipeline rebuild — e.g. its sources were
+  removed or it merged into a different golden_id). Opens as a separate panel from the
+  customer detail modal, showing the record's key identifiers plus a newest-first
+  timeline where each edit is one entry with expandable old→new field-level diffs.
+  Viewable by any user with gold `read` or `read_write` access — same gating as viewing
+  the record itself. There is no update/delete endpoint for it, by design.
 - **Data Governance** (`/portal/`, "Data Governance" tab) — an explorable **network
   diagram** of the entire lineage metadata graph (bronze → silver → gold →
   stewardship), pannable and zoomable. Click any node to highlight its full
@@ -105,7 +114,7 @@ python scripts\load_bronze.py
 python scripts\build_pipeline.py
 ```
 
-`build_pipeline.py` runs four steps in order and stops if any of them fail:
+`build_pipeline.py` runs five steps in order and stops if any of them fail:
 
 ```powershell
 cd dbt_project
@@ -117,7 +126,13 @@ python scripts\generate_matches.py     # embedding-based match/merge -- needs si
 cd dbt_project
 dbt --no-partial-parse run --select gold.*
 cd ..
+python scripts\audit_pipeline_diff.py  # logs creates/updates/logical deletes to the gold-layer audit trail
 ```
+
+If you ever rebuild just the gold layer by hand (`dbt run --select gold.*`, e.g. after a
+Match Review confirm/reject) instead of via `build_pipeline.py`, run
+`python scripts\audit_pipeline_diff.py` afterward too — otherwise that rebuild's changes
+won't show up in the Audit Trail.
 
 `--no-partial-parse` forces a full reparse instead of trusting dbt's
 `target/partial_parse.msgpack` cache. Without it, a manifest cache left over
@@ -206,6 +221,7 @@ Enable AI remediation with `export ANTHROPIC_API_KEY=your_key_here` before start
 | `GET /api/v1/customers/{golden_id}` | Get one golden record |
 | `PUT /api/v1/customers/{golden_id}` | Edit a golden record (requires `read_write` gold access) |
 | `GET /api/v1/customers/{golden_id}/sources` | Crosswalk: contributing source records |
+| `GET /api/v1/customers/{golden_id}/audit-trail` | Read-only history: creation, edits, logical deletes (any gold `read`/`read_write` access) |
 | `GET /api/v1/lineage/impact?layer=&table=&column=` | Forward impact analysis |
 | `GET /api/v1/lineage/trace?layer=&table=&column=` | Backward lineage trace |
 | `GET /api/v1/lineage/record/{golden_id}` | Full lineage for one golden record |
@@ -271,3 +287,10 @@ All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints requ
   assign (dbt's match-group numbering is order-dependent on the complete silver
   set). Both paths stay internally consistent; the ID numbers themselves aren't
   guaranteed portable between a live-reprocessed record and a full pipeline rerun.
+- **Audit Trail** (`api/audit.py`, `scripts/audit_pipeline_diff.py`) is append-only by
+  construction — no code path anywhere issues an UPDATE or DELETE against it, and there's
+  no write/delete endpoint. It inherits the golden-ID-renumbering caveat above: if a
+  reprocessing-created golden_id gets renumbered by the next full `dbt run`, the trail
+  shows the old number as logically deleted and the new number as created, even though
+  it's the same customer. It also only captures a manual `dbt run --select gold.*` if
+  `audit_pipeline_diff.py` is run immediately after (automatic inside `build_pipeline.py`).

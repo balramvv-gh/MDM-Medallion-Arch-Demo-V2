@@ -85,7 +85,19 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
    independently in the Stewardship frontend). Has:
    - **Browse Customers** — searchable/paginated gold-layer browser with live (debounced)
      search-as-you-type, click-through detail view with the source crosswalk, inline edit
-     if the user's account has `read_write` gold access.
+     if the user's account has `read_write` gold access, and an **Audit Trail** button
+     opening a read-only history panel for that golden record (see below).
+   - **Audit Trail** — append-only history of every golden record: creation, every edit
+     (manual portal edit, steward real-time reprocessing, or batch pipeline recompute),
+     and logical deletes (a golden_id no longer produced by a pipeline rebuild). Opens
+     from a button on the customer detail modal as a separate panel showing the record's
+     key identifiers up top and a newest-first timeline below, grouped into one entry per
+     logical change with expandable old→new field diffs. Viewable by anyone with gold
+     `read` or `read_write` access (`GET /api/v1/customers/{golden_id}/audit-trail`); there
+     is no write/delete endpoint for it by design — no code path anywhere updates or
+     deletes an audit row once written, which is the actual enforcement mechanism (DuckDB
+     has no per-table grants to lean on here, same app-level-only security model as
+     `gold_access` itself). See `api/audit.py` and Key data model notes below.
    - **Data Governance** — a full pannable/zoomable **network diagram** of the entire
      lineage metadata graph (bronze→silver→gold→stewardship). Click any node to highlight
      its upstream lineage (amber) and downstream impact (green) directly on the graph, with
@@ -127,6 +139,18 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   pattern, for `gold_match_review_queue` instead of `exceptions_queue`. A 'confirmed'
   override is honored by `generate_matches.py` as a forced union-find merge on the next
   run; a 'rejected' override permanently excludes that pair from ever resurfacing.
+- `audit.audit_trail` — append-only gold-layer audit trail (`api/audit.py`). One row per
+  changed field per logical operation, grouped by `change_batch_id` (all field rows from
+  one edit share a batch id so the UI renders one timeline entry per edit). Three writers:
+  `api/main.py`'s `update_customer()` (`event_source='portal_manual_edit'`),
+  `api/reprocessing.py` (`'steward_reprocessing'`), and `scripts/audit_pipeline_diff.py`
+  (`'pipeline_batch'`, run as the final step of `scripts/build_pipeline.py`). No code
+  anywhere issues an UPDATE/DELETE against this table.
+- `audit.gold_customers_snapshot` — a copy of `main_gold.gold_customers`'s tracked columns
+  as of the last batch pipeline run, kept in the `audit` schema specifically because `dbt
+  run` never touches that schema (it CREATE OR REPLACEs `main_gold.gold_customers` every
+  run). `scripts/audit_pipeline_diff.py` diffs the fresh gold table against this snapshot
+  to detect batch-driven creates/updates/logical-deletes, then refreshes it.
 
 ## Known simplifications (documented on purpose, not oversights)
 
@@ -151,7 +175,15 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 - Real-time reprocessing's match step compares against each golden record's *current*
   survivor values, not every historical non-survivor source in that group.
 - New golden IDs from real-time reprocessing increment the current max, which can diverge
-  from what a full `dbt run` would assign from scratch.
+  from what a full `dbt run` would assign from scratch. The audit trail inherits this: if
+  a reprocessing-created golden_id gets renumbered by the next full rebuild,
+  `audit_pipeline_diff.py` logs the old number as `logically_deleted` and the new number
+  as `created`, even though it's the same underlying customer — not a bug in the diff
+  logic, an accepted consequence of the numbering scheme itself.
+- The audit trail only captures a manual `dbt run --select gold.*` if
+  `scripts/audit_pipeline_diff.py` is run immediately afterward (this happens
+  automatically inside `build_pipeline.py`, but not if you run the gold rebuild command
+  by itself, e.g. after a Match Review confirm/reject).
 - Auth is sized for a demo: no MFA, no refresh tokens, single local DuckDB file (not a
   concurrent multi-user warehouse).
 
@@ -160,12 +192,13 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 ```
 data/                  synthetic CRM+ERP source data generator (Faker-based, ~100 rows/source)
 scripts/                load_bronze.py, generate_matches.py (fuzzy match/merge, Python step
-                        between silver and gold), build_pipeline.py (runs the 4-stage build),
-                        create_admin_user.py, reset_admin_password.py
+                        between silver and gold), build_pipeline.py (runs the 5-stage build),
+                        audit_pipeline_diff.py (gold-layer audit trail diff, final build
+                        step), create_admin_user.py, reset_admin_password.py
 dbt_project/            seeds (rules/reference/lineage metadata), models (silver, gold);
                         gold reads scripts/generate_matches.py's output via the gold_prep source
 api/                    FastAPI app: main.py, db.py, auth.py, reprocessing.py,
-                        lineage.py, ai_remediation.py
+                        lineage.py, ai_remediation.py, audit.py (gold-layer audit trail)
 stewardship_app/frontend/   exception queue + match review console (plain HTML/JS)
 portal_app/frontend/        login-gated portal: browse, governance graph, admin (plain HTML/JS)
 requirements.txt        pinned deps (duckdb==1.5.4 -- NOT the same version number as the
