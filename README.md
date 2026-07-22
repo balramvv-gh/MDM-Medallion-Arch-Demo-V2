@@ -56,14 +56,26 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
   timeline where each edit is one entry with expandable old→new field-level diffs.
   Viewable by any user with gold `read` or `read_write` access — same gating as viewing
   the record itself. There is no update/delete endpoint for it, by design.
-- **Data Governance** (`/portal/`, "Data Governance" tab) — an explorable **network
-  diagram** of the entire lineage metadata graph (bronze → silver → gold →
-  stewardship), pannable and zoomable. Click any node to highlight its full
-  upstream lineage (amber) and downstream impact (green) directly on the graph,
-  and see details — description, direct incoming/outgoing rules, and
-  upstream/downstream node counts — in a side panel. Clicking a gold-layer node
-  also offers a quick lookup of any specific Golden ID's contributing source
-  records.
+- **Data Governance** (`/portal/`, a nav dropdown) — two items, each independently
+  visible based on the signed-in user's role/access, so the dropdown itself is hidden
+  if neither would show:
+  - **Data Stewardship** — visible only to `dataSteward`/`dataOwner` accounts (the
+    same role gate as the Stewardship console itself). Opens `/app/` in a browser tab
+    named `mdmStewardshipTab`; clicking it again while that tab is still open
+    refocuses the same tab instead of opening a duplicate, since `window.open()`
+    re-targets a tab by name rather than always creating a new one.
+  - **Lineage and Impact Analysis** — visible to any user with gold `read` or
+    `read_write` access (this only gates the portal's nav item; the underlying
+    `/api/v1/lineage/*` endpoints remain open to any authenticated user regardless
+    of `gold_access`, since the lineage graph is classified as pipeline metadata,
+    not gold customer data — an intentional, pre-existing distinction). An
+    explorable **network diagram** of the entire lineage metadata graph
+    (bronze → silver → gold → stewardship), pannable and zoomable. Click any node
+    to highlight its full upstream lineage (amber) and downstream impact (green)
+    directly on the graph, and see details — description, direct incoming/outgoing
+    rules, and upstream/downstream node counts — in a side panel. Clicking a
+    gold-layer node also offers a quick lookup of any specific Golden ID's
+    contributing source records.
 - **REST API** — exposes the gold layer (and its crosswalk) for downstream system
   consumption.
 

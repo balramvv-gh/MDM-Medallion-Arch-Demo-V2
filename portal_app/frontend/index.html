@@ -279,9 +279,15 @@
       <h1>MDM Data Hub Portal</h1>
       <nav>
         <button id="navBrowse" class="active" onclick="showView('browse')">Browse Customers</button>
-        <button id="navLineage" onclick="showView('lineage')">Data Governance</button>
+        <span class="dropdown" id="govDropdown">
+          <button onclick="toggleDropdown('govDropdown')">Data Governance ▾</button>
+          <span class="dropdown-menu">
+            <button id="navStewardship" onclick="launchStewardshipApp()">Data Stewardship</button>
+            <button id="navLineage" onclick="showView('lineage')">Lineage and Impact Analysis</button>
+          </span>
+        </span>
         <span class="dropdown" id="adminDropdown">
-          <button onclick="toggleAdminMenu()">Administration ▾</button>
+          <button onclick="toggleDropdown('adminDropdown')">Administration ▾</button>
           <span class="dropdown-menu">
             <button onclick="showView('users')">User Administration</button>
           </span>
@@ -455,6 +461,18 @@ function enterApp() {
   document.getElementById('userFullName').textContent = session.user.full_name;
   document.getElementById('userRoleBadge').textContent = roleLabel(session.user.role).toUpperCase();
   document.getElementById('adminDropdown').style.display = session.user.role === 'admin' ? 'inline-block' : 'none';
+
+  // Data Governance sub-items: Data Stewardship requires the same role gate as the
+  // Stewardship console itself (dataSteward/dataOwner -- api/auth.py's
+  // require_steward_or_owner); Lineage and Impact Analysis requires gold-layer
+  // access (read or read_write). The parent menu is hidden only if neither
+  // sub-item would be visible, so it's never shown empty.
+  const canSteward = session.user.role === 'dataSteward' || session.user.role === 'dataOwner';
+  const canGold = session.user.gold_access === 'read' || session.user.gold_access === 'read_write';
+  document.getElementById('navStewardship').style.display = canSteward ? 'block' : 'none';
+  document.getElementById('navLineage').style.display = canGold ? 'block' : 'none';
+  document.getElementById('govDropdown').style.display = (canSteward || canGold) ? 'inline-block' : 'none';
+
   loadCustomers();
 }
 
@@ -514,17 +532,34 @@ function showView(name) {
   document.getElementById('navBrowse').classList.toggle('active', name === 'browse');
   document.getElementById('navLineage').classList.toggle('active', name === 'lineage');
   document.getElementById('adminDropdown').classList.remove('open');
+  document.getElementById('govDropdown').classList.remove('open');
   if (name === 'users') loadUsers();
   if (name === 'lineage') initLineageView();
 }
 
-function toggleAdminMenu() {
-  document.getElementById('adminDropdown').classList.toggle('open');
+function toggleDropdown(id) {
+  document.querySelectorAll('.dropdown.open').forEach(d => { if (d.id !== id) d.classList.remove('open'); });
+  document.getElementById(id).classList.toggle('open');
 }
 document.addEventListener('click', (e) => {
-  const dd = document.getElementById('adminDropdown');
-  if (dd && !dd.contains(e.target)) dd.classList.remove('open');
+  document.querySelectorAll('.dropdown').forEach(dd => {
+    if (!dd.contains(e.target)) dd.classList.remove('open');
+  });
 });
+
+// Opens the Data Stewardship console (/app/) in a browser tab named
+// "mdmStewardshipTab". If that named tab is still open from a previous click,
+// window.open() re-targets it instead of creating a duplicate, and .focus()
+// brings it to the front -- this is what "launch if not already launched,
+// otherwise shift control to it" means in a plain-HTML/JS app with no
+// cross-tab state of its own. Caveat: this only recognizes tabs opened via
+// this button; a Stewardship tab opened by directly visiting /app/ won't be
+// detected as "already open" and a second tab would be opened alongside it.
+function launchStewardshipApp() {
+  const stewardshipTab = window.open('/app/', 'mdmStewardshipTab');
+  if (stewardshipTab) stewardshipTab.focus();
+  document.getElementById('govDropdown').classList.remove('open');
+}
 
 function debouncedSearch() {
   clearTimeout(searchDebounce);

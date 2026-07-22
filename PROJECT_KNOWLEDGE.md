@@ -98,12 +98,23 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
      deletes an audit row once written, which is the actual enforcement mechanism (DuckDB
      has no per-table grants to lean on here, same app-level-only security model as
      `gold_access` itself). See `api/audit.py` and Key data model notes below.
-   - **Data Governance** — a full pannable/zoomable **network diagram** of the entire
-     lineage metadata graph (bronze→silver→gold→stewardship). Click any node to highlight
-     its upstream lineage (amber) and downstream impact (green) directly on the graph, with
-     a side detail panel (description, direct in/out rules, upstream/downstream counts).
-     Clicking a gold node adds a Golden ID lookup tool. This replaced an earlier two-mode
-     "pick a column, see a static chain" version entirely, by design.
+   - **Data Governance** (nav dropdown, two independently-gated items — the dropdown
+     itself hides if neither is visible to the signed-in user):
+     - **Data Stewardship** — visible only to `dataSteward`/`dataOwner` (same role gate
+       as the console). Opens `/app/` via `window.open('/app/', 'mdmStewardshipTab')`;
+       clicking again while that named tab is still open re-focuses it instead of
+       spawning a duplicate — the "launch if not open, else shift control to it"
+       behavior, implemented with the browser's native named-window targeting rather
+       than any cross-tab messaging. Only recognizes tabs opened via this button.
+     - **Lineage and Impact Analysis** — visible only with gold `read`/`read_write`
+       access; this gates the nav item only — `/api/v1/lineage/*` stays open to any
+       authenticated user regardless of `gold_access` (deliberate, pre-existing:
+       pipeline metadata, not gold customer data). A full pannable/zoomable **network
+       diagram** of the entire lineage metadata graph (bronze→silver→gold→stewardship).
+       Click any node to highlight its upstream lineage (amber) and downstream impact
+       (green) directly on the graph, with a side detail panel (description, direct
+       in/out rules, upstream/downstream counts). Clicking a gold node adds a Golden ID
+       lookup tool.
    - **Administration → User Administration** — admin-only. Create/edit/deactivate users,
      assign role (`admin`/`dataSteward`/`dataOwner`/`businessUser`) and gold access
      (`read_write`/`read`/`none`), reset passwords. The seed admin account is `mdm_admin`, created via
