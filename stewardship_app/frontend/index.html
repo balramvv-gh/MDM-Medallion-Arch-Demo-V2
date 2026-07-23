@@ -352,6 +352,7 @@
 <div class="view-tabs">
   <button class="view-tab active" id="tabExceptions" onclick="switchView('exceptions')">Exception Queue</button>
   <button class="view-tab" id="tabMatchReview" onclick="switchView('matchReview')">Match Review</button>
+  <button class="view-tab" id="tabApprovals" onclick="switchView('approvals')">Approvals</button>
 </div>
 
 <main>
@@ -376,8 +377,10 @@ function roleLabel(role) { return ROLE_LABELS[role] || role; }
 let session = null;           // {token, user}
 let currentItem = null;
 let editedFields = {};
-let currentView = 'exceptions';   // 'exceptions' | 'matchReview'
+let currentView = 'exceptions';   // 'exceptions' | 'matchReview' | 'approvals'
 let currentMatchItem = null;
+let currentApprovalItem = null;
+let approvalsMode = 'pending';    // 'pending' (awaiting my decision) | 'mine' (my submissions)
 
 function authHeaders() {
   return { 'Authorization': `Bearer ${session.token}`, 'Content-Type': 'application/json' };
@@ -462,18 +465,24 @@ function switchView(view) {
   currentView = view;
   document.getElementById('tabExceptions').classList.toggle('active', view === 'exceptions');
   document.getElementById('tabMatchReview').classList.toggle('active', view === 'matchReview');
-  document.getElementById('queueCountLabel').textContent = view === 'exceptions' ? 'Open exceptions' : 'Pending matches';
+  document.getElementById('tabApprovals').classList.toggle('active', view === 'approvals');
+  document.getElementById('queueCountLabel').textContent =
+    view === 'exceptions' ? 'Open exceptions' : view === 'matchReview' ? 'Pending matches' : 'Awaiting my decision';
   currentItem = null;
   currentMatchItem = null;
+  currentApprovalItem = null;
   document.getElementById('detailPanel').innerHTML = view === 'exceptions'
     ? '<div class="empty-state">Select a record from the queue to begin remediation.</div>'
-    : '<div class="empty-state">Select a candidate pair to review.</div>';
+    : view === 'matchReview'
+    ? '<div class="empty-state">Select a candidate pair to review.</div>'
+    : '<div class="empty-state">Select an item to approve or reject.</div>';
   loadQueue();
 }
 
 async function loadQueue() {
   if (currentView === 'exceptions') return loadExceptionQueue();
-  return loadMatchReviewQueue();
+  if (currentView === 'matchReview') return loadMatchReviewQueue();
+  return loadApprovalsQueue();
 }
 
 async function loadExceptionQueue() {
@@ -599,14 +608,8 @@ async function resolveItem() {
   btn.disabled = false;
   if (res.ok) {
     const data = await res.json();
-    const rp = data.reprocessing;
-    let msg = 'Record resolved.';
-    if (rp) {
-      msg = rp.action === 'created_new_golden_record'
-        ? `Resolved — no match found, created new golden record ${rp.golden_id}.`
-        : `Resolved — matched and updated golden record ${rp.golden_id} (${rp.matched_existing_sources} other source${rp.matched_existing_sources === 1 ? '' : 's'}).`;
-    }
-    showToast(msg);
+    const steps = (data.steps || []).map(s => s.step_name).join(' → ');
+    showToast(`Submitted for approval${steps ? ' (' + steps + ')' : ''}. It will reprocess once approved.`);
     currentItem = null;
     document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select a record from the queue to begin remediation.</div>';
     loadQueue();
@@ -639,7 +642,9 @@ async function rejectItem() {
     body: JSON.stringify({ steward_note: 'Rejected via stewardship console' }),
   });
   if (res.ok) {
-    showToast('Record rejected.');
+    const data = await res.json();
+    const steps = (data.steps || []).map(s => s.step_name).join(' → ');
+    showToast(`Rejection submitted for approval${steps ? ' (' + steps + ')' : ''}.`);
     currentItem = null;
     document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select a record from the queue to begin remediation.</div>';
     loadQueue();
@@ -713,7 +718,7 @@ async function confirmMatch() {
   });
   if (res.ok) {
     const data = await res.json();
-    showToast(data.note || 'Match confirmed.');
+    showToast(data.note || 'Submitted for approval.');
     currentMatchItem = null;
     document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select a candidate pair to review.</div>';
     loadMatchReviewQueue();
@@ -727,11 +732,152 @@ async function rejectMatch() {
   });
   if (res.ok) {
     const data = await res.json();
-    showToast(data.note || 'Match rejected.');
+    showToast(data.note || 'Submitted for approval.');
     currentMatchItem = null;
     document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select a candidate pair to review.</div>';
     loadMatchReviewQueue();
   }
+}
+
+// ---------------- Approvals (generic maker-checker) ----------------
+
+const WORKFLOW_TYPE_LABELS = {
+  stewardship_remediation: 'Exception Remediation',
+  gold_record_edit: 'Gold Record Edit',
+  match_review_confirmation: 'Match Review Confirmation',
+  user_admin_change: 'User Administration',
+};
+
+function summarizeInstance(inst) {
+  const p = inst.payload || {};
+  if (inst.workflow_type === 'stewardship_remediation') {
+    if (inst.action_type === 'resolve') {
+      const fieldStr = Object.entries(p.applied_fields || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
+      return `Resolve exception ${inst.entity_id.slice(0, 8)}… — ${fieldStr || 'no field changes'}`;
+    }
+    return `Reject exception ${inst.entity_id.slice(0, 8)}…${p.steward_note ? ' — ' + p.steward_note : ''}`;
+  }
+  if (inst.workflow_type === 'gold_record_edit') {
+    const fieldStr = Object.entries(p.updates || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
+    return `Edit golden record ${inst.entity_id} — ${fieldStr}`;
+  }
+  if (inst.workflow_type === 'match_review_confirmation') {
+    return `${inst.action_type === 'confirm' ? 'Confirm' : 'Reject'} match pair ${inst.entity_id.slice(0, 8)}…${p.steward_note ? ' — ' + p.steward_note : ''}`;
+  }
+  if (inst.workflow_type === 'user_admin_change') {
+    if (inst.action_type === 'create') return `Create user '${p.username}' (${p.role}, gold_access=${p.gold_access})`;
+    const fieldStr = Object.entries(p.updates || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
+    return `Update user ${inst.entity_id} — ${fieldStr}`;
+  }
+  return JSON.stringify(p);
+}
+
+function currentStepLabel(inst) {
+  const step = (inst.steps || []).find(s => s.step_order === inst.current_step);
+  return step ? `${step.step_name} (step ${step.step_order} of ${inst.steps.length})` : '';
+}
+
+async function loadApprovalsQueue() {
+  const panel = document.getElementById('queuePanel');
+  const url = approvalsMode === 'pending' ? `${API}/workflows/pending` : `${API}/workflows/mine`;
+  const res = await fetch(url, { headers: authHeaders() });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('queueCount').textContent = data.items.length;
+
+  const toggle = `
+    <div style="display:flex;gap:8px;padding:12px 20px;border-bottom:1px solid var(--border);">
+      <button class="view-tab ${approvalsMode === 'pending' ? 'active' : ''}" style="padding:6px 10px;font-size:12px;" onclick="setApprovalsMode('pending')">Awaiting my decision</button>
+      <button class="view-tab ${approvalsMode === 'mine' ? 'active' : ''}" style="padding:6px 10px;font-size:12px;" onclick="setApprovalsMode('mine')">My submissions</button>
+    </div>`;
+
+  if (data.items.length === 0) {
+    panel.innerHTML = toggle + `<div class="empty-state">${approvalsMode === 'pending' ? 'Nothing awaiting your decision.' : 'You have not submitted anything yet.'}</div>`;
+    return;
+  }
+  panel.innerHTML = toggle + data.items.map(inst => `
+    <div class="queue-item" data-id="${inst.instance_id}" onclick="selectApprovalItem('${inst.instance_id}')">
+      <div class="qid">${WORKFLOW_TYPE_LABELS[inst.workflow_type] || inst.workflow_type} · ${inst.status.toUpperCase()}</div>
+      <div class="qname">${escapeApprovalText(summarizeInstance(inst))}</div>
+      <span class="qreason" style="color:var(--amber);background:rgba(232,165,75,0.1);">${approvalsMode === 'pending' ? currentStepLabel(inst) : 'by ' + inst.maker_label}</span>
+    </div>
+  `).join('');
+}
+
+function setApprovalsMode(mode) {
+  approvalsMode = mode;
+  currentApprovalItem = null;
+  document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select an item to approve or reject.</div>';
+  loadApprovalsQueue();
+}
+
+async function selectApprovalItem(instanceId) {
+  document.querySelectorAll('.queue-item').forEach(el => el.classList.toggle('active', el.dataset.id === instanceId));
+  const res = await fetch(`${API}/workflows/${instanceId}`, { headers: authHeaders() });
+  currentApprovalItem = await res.json();
+  renderApprovalDetail();
+}
+
+function renderApprovalDetail() {
+  const inst = currentApprovalItem;
+  const panel = document.getElementById('detailPanel');
+  const decisionsHtml = (inst.decisions || []).map(d => `
+    <div class="compare-row"><label>${escapeApprovalText(d.actor_label)} · step ${d.step_order}</label>
+    <div class="val">${d.decision.toUpperCase()}${d.comment ? ' — ' + escapeApprovalText(d.comment) : ''}</div></div>
+  `).join('') || '<div style="font-size:12px;color:var(--text-dim);">No decisions recorded yet.</div>';
+
+  const canDecide = approvalsMode === 'pending' && inst.status === 'pending';
+
+  panel.innerHTML = `
+    <div class="record-header">
+      <h2>${WORKFLOW_TYPE_LABELS[inst.workflow_type] || inst.workflow_type}</h2>
+      <span class="source-badge">${inst.status.toUpperCase()}</span>
+    </div>
+    <div class="reasons-box" style="background:var(--panel);border-color:var(--border);">
+      <div class="label" style="color:var(--text-dim);">SUBMITTED BY</div>
+      <ul><li>${escapeApprovalText(inst.maker_label)} — ${escapeApprovalText(summarizeInstance(inst))}</li></ul>
+    </div>
+    <div class="ai-panel">
+      <div class="ai-header"><span class="dot"></span><span>${inst.status === 'pending' ? currentStepLabel(inst) : 'FINAL OUTCOME'}</span></div>
+      <div class="compare-grid" style="display:block;border:none;">
+        ${decisionsHtml}
+      </div>
+      ${inst.result ? `<div class="rationale" style="margin-top:10px;">Result: <code>${escapeApprovalText(JSON.stringify(inst.result))}</code></div>` : ''}
+    </div>
+    ${canDecide ? `
+    <div class="field" style="margin-bottom:16px;">
+      <label>COMMENT (optional)</label>
+      <input type="text" id="approvalComment" placeholder="Add a note for the audit trail…">
+    </div>
+    <div class="actions">
+      <button class="btn-resolve" onclick="decideApproval('approved')">Approve</button>
+      <button class="btn-reject" onclick="decideApproval('rejected')">Reject</button>
+    </div>` : ''}
+  `;
+}
+
+async function decideApproval(decision) {
+  const commentEl = document.getElementById('approvalComment');
+  const comment = commentEl ? (commentEl.value || null) : null;
+  const res = await fetch(`${API}/workflows/${currentApprovalItem.instance_id}/decide`, {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({ decision, comment }),
+  });
+  const data = await res.json();
+  if (res.ok) {
+    showToast(decision === 'approved'
+      ? (data.status === 'approved' ? 'Approved — workflow complete.' : `Approved — advanced to ${currentStepLabel(data)}.`)
+      : 'Rejected.');
+    currentApprovalItem = null;
+    document.getElementById('detailPanel').innerHTML = '<div class="empty-state">Select an item to approve or reject.</div>';
+    loadApprovalsQueue();
+  } else {
+    showToast(data.detail || 'Could not record your decision.', 'error');
+  }
+}
+
+function escapeApprovalText(str) {
+  return String(str).replace(/[<>&"']/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c]));
 }
 
 function showToast(msg, kind) {

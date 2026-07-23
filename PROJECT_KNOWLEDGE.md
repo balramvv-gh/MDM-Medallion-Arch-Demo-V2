@@ -69,24 +69,36 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 
 ## Applications
 
-1. **Data Stewardship console** (`/app/`) — two tabs.
+1. **Data Stewardship console** (`/app/`) — three tabs.
    - **Exception Queue** — reviews the exception queue, gets an
      AI-assisted remediation suggestion (real Claude API call via `ANTHROPIC_API_KEY`, with a
      transparent heuristic fallback when no key is set — every suggestion response includes
-     `source: "ai"` or `"heuristic_fallback"`), and approves/rejects corrections. **Approving
-     a correction triggers real-time reprocessing**: the corrected record is upserted into
-     silver, matched against the current gold set using the same tier-1 exact_match_field
+     `source: "ai"` or `"heuristic_fallback"`), and resolves/rejects corrections. **Resolving
+     or rejecting now submits into the maker-checker workflow** (`stewardship_remediation`,
+     1 Data Owner approver, different from the steward) instead of applying immediately —
+     see the Maker-Checker Workflow Engine section below. Only once approved does
+     resolving actually **trigger real-time reprocessing**: the corrected record is upserted
+     into silver, matched against the current gold set using the same tier-1 exact_match_field
      rules from `matching_rules.csv` the batch pipeline reads (exact tier only, see known
      simplifications), and survivorship is re-run to either update the matched golden
-     record or create a new one.
+     record or create a new one; a rejected approval returns the exception to the open queue.
      This mirrors the batch dbt logic so both paths stay consistent, though golden ID numbering
      can diverge between them (documented limitation).
    - **Match Review** — borderline fuzzy-match candidates from the gold layer's
      embedding-similarity tier (similarity between the review and auto-merge thresholds),
-     shown side by side, for the steward to confirm or reject. Unlike exception resolution,
-     confirm/reject does NOT reprocess in real time (re-clustering is a global union-find
-     recompute, not a local update) — it writes to `stewardship.match_review_overrides` and
-     takes effect on the next `python scripts/generate_matches.py && dbt run --select gold.*`.
+     shown side by side, for the steward to confirm or reject. Confirm/reject now also
+     submits into a maker-checker workflow (`match_review_confirmation`, 2 sequential
+     levels: Data Owner, then Admin) rather than recording immediately. Once approved,
+     confirm/reject still does NOT reprocess in real time (re-clustering is a global
+     union-find recompute, not a local update) — it writes to
+     `stewardship.match_review_overrides` and takes effect on the next
+     `python scripts/generate_matches.py && dbt run --select gold.*`.
+   - **Approvals** — lists workflow instances awaiting this user's decision ("Awaiting my
+     decision") or previously submitted by them ("My submissions"), for any of the
+     workflow types whose current step matches their role. Backed by the same generic
+     `GET /api/v1/workflows/pending` / `GET /api/v1/workflows/mine` /
+     `POST /api/v1/workflows/{instance_id}/decide` endpoints the Portal's Approvals view
+     uses.
 
 2. **MDM Data Hub Portal** (`/portal/`) — login-gated, SSO'd with the Stewardship
    app. Roles are `admin` / `dataSteward` / `dataOwner` / `businessUser`; gold
@@ -98,7 +110,16 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
    - **Browse Customers** — searchable/paginated gold-layer browser with live (debounced)
      search-as-you-type, click-through detail view with the source crosswalk, inline edit
      if the user's account has `read_write` gold access, and an **Audit Trail** button
-     opening a read-only history panel for that golden record (see below).
+     opening a read-only history panel for that golden record (see below). **An inline
+     edit now submits into the `gold_record_edit` maker-checker workflow** (1 level, a
+     quorum of 2 *different* Data Owners) instead of applying immediately — the response
+     is `{status: "pending_approval", workflow_instance_id, steps}` rather than the
+     updated record, and the audit-trail entry (once it does apply) still attributes the
+     edit to the maker, not the approvers.
+   - **Approvals** — a nav item visible to every signed-in role (not just
+     dataSteward/dataOwner), since Admins — who approve Match Review's second level and
+     User Administration changes — don't have access to the Stewardship Console. Same
+     "awaiting my decision" / "my submissions" split as the console's Approvals tab.
    - **Audit Trail** — append-only history of every golden record: creation, every edit
      (manual portal edit, steward real-time reprocessing, or batch pipeline recompute),
      and logical deletes (a golden_id no longer produced by a pipeline rebuild). Opens
@@ -131,9 +152,37 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
      assign role (`admin`/`dataSteward`/`dataOwner`/`businessUser`) and gold access
      (`read_write`/`read`/`none`), reset passwords. The seed admin account is `mdm_admin`, created via
      `scripts/create_admin_user.py`, which prints a one-time random password to the
-     terminal — never stored in plaintext, never baked into the shipped zip.
+     terminal — never stored in plaintext, never baked into the shipped zip. **Creating a
+     user, or changing `role`/`gold_access`/`is_active` on an existing one, now submits
+     into the `user_admin_change` maker-checker workflow** (1 level, 1 Admin approver who
+     must be a different admin than the requester) — the new-user's one-time password is
+     generated only at approval time and shown only to the approver, not the requester.
+     `full_name`-only edits and password resets are not gated (they don't change what a
+     user is authorized to do) and still apply immediately.
 
-3. **REST API** — exposes the gold layer, crosswalk, lineage graph, and stewardship queue
+3. **Maker-Checker Approval Workflow Engine** (`api/workflow_engine.py`, `governance`
+   schema) — generic across all three apps, added so a maker can never be the sole
+   authority on a state-changing action. A `workflow_type` is an ordered list of steps
+   (`governance.workflow_definitions`, seeded once on first boot and left alone
+   thereafter so a future Rules Configuration screen can edit it at runtime); each step
+   names a `required_role` and an `approvals_required` count (1 for a simple single
+   approver, >1 for a same-level quorum of *different* people). The engine itself
+   enforces, independent of any caller: a maker can never decide on their own
+   submission, the same approver can never cast two decisions on one instance, and
+   rejection at any step is terminal. Four workflows are configured today:
+   `stewardship_remediation` (1 level, 1 Data Owner), `gold_record_edit` (1 level,
+   quorum of 2 Data Owners), `match_review_confirmation` (2 sequential levels: Data
+   Owner, then Admin), and `user_admin_change` (1 level, 1 Admin). Generic endpoints —
+   `GET /api/v1/workflows/pending`, `GET /api/v1/workflows/mine`,
+   `GET /api/v1/workflows/{instance_id}`, `POST /api/v1/workflows/{instance_id}/decide`
+   — serve an **Approvals** view in both the Stewardship Console and the Portal (the
+   Portal's copy is visible to every role, since Admins can't reach the console).
+   `scripts/create_demo_governance_users.py` seeds the extra `dataOwner`/`admin`
+   accounts (`mdm_dataowner2`, `mdm_dataowner3`, `mdm_admin2`) needed to actually clear
+   a quorum or a "different approver" requirement in a fresh install, which otherwise
+   ships with only one account per role.
+
+4. **REST API** — exposes the gold layer, crosswalk, lineage graph, and stewardship queue
    for downstream consumption. Auto-docs at `/docs`.
 
 ## Key data model notes
@@ -184,6 +233,13 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   `api/reprocessing.py` (`'steward_reprocessing'`), and `scripts/audit_pipeline_diff.py`
   (`'pipeline_batch'`, run as the final step of `scripts/build_pipeline.py`). No code
   anywhere issues an UPDATE/DELETE against this table.
+- `governance.workflow_definitions` / `workflow_instances` / `workflow_decisions` — the
+  maker-checker engine's own tables (`api/workflow_engine.py`). Definitions are seeded
+  once (first boot with an empty table) and then left alone so future edits (planned
+  Rules Configuration screen) persist across restarts; instances carry a JSON `payload`
+  (whatever the completion callback needs to apply the change) and, once
+  approved/rejected, a JSON `result`; decisions are one row per approver per step, which
+  is how the engine enforces "no double-deciding" and quorum counts.
 - `audit.gold_customers_snapshot` — a copy of `main_gold.gold_customers`'s tracked columns
   as of the last batch pipeline run, kept in the `audit` schema specifically because `dbt
   run` never touches that schema (it CREATE OR REPLACEs `main_gold.gold_customers` every
@@ -232,6 +288,15 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   by itself, e.g. after a Match Review confirm/reject).
 - Auth is sized for a demo: no MFA, no refresh tokens, single local DuckDB file (not a
   concurrent multi-user warehouse).
+- The maker-checker engine only gates the four workflows listed above; Reference Data
+  Maintenance and Rules Configuration (planned Data Governance screens, not yet built)
+  aren't covered by it yet. If the domain action itself fails after every required
+  approval is already recorded (e.g. a downstream write error), the instance is still
+  marked `approved` — the human decision stands — with the failure captured in its
+  `result` field rather than silently rolled back; there is no automatic retry. A
+  quorum or multi-level chain also needs enough distinct people in the required role to
+  ever clear, since a maker can't approve their own submission and the same approver
+  can't decide twice on one instance — hence `scripts/create_demo_governance_users.py`.
 
 ## Repo structure
 
@@ -240,15 +305,20 @@ data/                  synthetic CRM+ERP source data generator (Faker-based, ~10
 scripts/                load_bronze.py, generate_matches.py (fuzzy match/merge, Python step
                         between silver and gold), build_pipeline.py (runs the 5-stage build),
                         audit_pipeline_diff.py (gold-layer audit trail diff, final build
-                        step), create_admin_user.py, reset_admin_password.py
+                        step), create_admin_user.py, reset_admin_password.py,
+                        create_demo_governance_users.py (seeds extra dataOwner/admin
+                        accounts needed to test maker-checker quorums/multi-level chains)
 dbt_project/            seeds (rules/reference/lineage/matching metadata -- column_rules.csv,
                         matching_thresholds.csv, matching_rules.csv, lineage_edges.csv,
                         ref_state_codes.csv, ref_country_codes.csv), models (silver, gold);
                         gold reads scripts/generate_matches.py's output via the gold_prep source
 api/                    FastAPI app: main.py, db.py, auth.py, reprocessing.py,
-                        lineage.py, ai_remediation.py, audit.py (gold-layer audit trail)
-stewardship_app/frontend/   exception queue + match review console (plain HTML/JS)
-portal_app/frontend/        login-gated portal: browse, governance graph, admin (plain HTML/JS)
+                        lineage.py, ai_remediation.py, audit.py (gold-layer audit trail),
+                        workflow_engine.py (generic maker-checker workflow engine)
+stewardship_app/frontend/   exception queue + match review console (plain HTML/JS), plus
+                        an Approvals tab over the maker-checker workflow engine
+portal_app/frontend/        login-gated portal: browse, governance graph, admin, and an
+                        Approvals view (plain HTML/JS)
 requirements.txt        pinned deps (duckdb==1.5.4 -- NOT the same version number as the
                         dbt-duckdb adapter, a mistake made once already, worth double-checking)
 README.md               Windows-first setup instructions (PowerShell), plus macOS/Linux
@@ -256,9 +326,13 @@ README.md               Windows-first setup instructions (PowerShell), plus macO
 
 ## Outstanding / not yet built
 
-- Professional Design Document and Technical Reference Document (Word/.docx deliverables),
-  matching the pattern already established on the user's earlier AI Product Recommendation
-  Engine portfolio project: working demo first, polished documentation second.
+- Two new Data Governance menu items, both meant to reuse the maker-checker workflow
+  engine once built: **Reference Data Maintenance** (Country Codes, State Codes, etc.)
+  and **Rules Configuration** (letting Data Governance users create/maintain Column
+  Rules, Matching Rules, and Survivorship Rules through the UI instead of a direct
+  seed-file edit). The engine and its `governance.workflow_definitions` table are
+  already designed to support this — a new `workflow_type` per screen is the expected
+  extension point, not a redesign.
 - CCA-F (Claude Certified Architect – Foundations) certification is a separate, unrelated
   thread the user is pursuing — exam access is gated behind the Claude Partner Network with
   no individual registration path found so far; using Skilljar course-completion

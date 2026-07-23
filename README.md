@@ -81,6 +81,18 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
     rules, and upstream/downstream node counts — in a side panel. Clicking a
     gold-layer node also offers a quick lookup of any specific Golden ID's
     contributing source records.
+- **Maker-Checker Approval Workflow Engine** — several state-changing actions across
+  both apps now submit into a generic, metadata-driven approval workflow
+  (`api/workflow_engine.py`, `governance.workflow_definitions`) instead of applying
+  immediately: stewardship remediation (resolve/reject an exception — 1 Data Owner),
+  a Portal gold-record edit (a quorum of 2 different Data Owners), a Match Review
+  confirm/reject (Data Owner, then Admin), and a User Administration create or
+  role/gold_access/is_active change (1 Admin, different from whoever requested it). A
+  maker can never approve their own submission, and the same approver can never
+  decide twice on one instance. Both apps expose an **Approvals** view (backed by
+  `GET /api/v1/workflows/pending`, `GET /api/v1/workflows/mine`, and
+  `POST /api/v1/workflows/{instance_id}/decide`) for seeing what's awaiting a
+  decision and what you've submitted.
 - **REST API** — exposes the gold layer (and its crosswalk) for downstream system
   consumption.
 
@@ -182,6 +194,18 @@ copy it now, it is never shown again (and never stored in plaintext; only its
 bcrypt hash is saved). If you ever get locked out, run
 `python scripts\reset_admin_password.py` to generate a new one.
 
+### Create demo governance accounts (optional, for testing approvals)
+
+```powershell
+python scripts\create_demo_governance_users.py
+```
+
+The maker-checker workflows above need a *different* person than the requester to
+approve (a Data Owner quorum needs 2 different Data Owners, a User Administration
+change needs a second Admin) — this project ships one account per role by default,
+which isn't enough on its own. This prints one-time passwords for `mdm_dataowner2`,
+`mdm_dataowner3`, and `mdm_admin2`. Safe to re-run; existing accounts are skipped.
+
 ### Run the app + API
 
 ```powershell
@@ -220,6 +244,7 @@ python3 scripts/load_bronze.py
 python3 scripts/build_pipeline.py      # seed -> silver -> match/merge -> gold
 
 python3 scripts/create_admin_user.py   # copy the printed one-time password
+python3 scripts/create_demo_governance_users.py   # optional: extra accounts to test maker-checker approvals
 
 cd api
 uvicorn main:app --reload --port 8000
@@ -236,24 +261,28 @@ Enable AI remediation with `export ANTHROPIC_API_KEY=your_key_here` before start
 | `GET /api/v1/auth/me` | Current user's identity/role/access |
 | `GET /api/v1/customers` | List golden customer records (auth required; supports `q=` search) |
 | `GET /api/v1/customers/{golden_id}` | Get one golden record |
-| `PUT /api/v1/customers/{golden_id}` | Edit a golden record (requires `read_write` gold access) |
+| `PUT /api/v1/customers/{golden_id}` | Submit a golden-record edit (requires `read_write` gold access; applies once a 2-Data-Owner quorum approves) |
 | `GET /api/v1/customers/{golden_id}/sources` | Crosswalk: contributing source records |
 | `GET /api/v1/customers/{golden_id}/audit-trail` | Read-only history: creation, edits, logical deletes (any gold `read`/`read_write` access) |
 | `GET /api/v1/lineage/impact?layer=&table=&column=` | Forward impact analysis |
 | `GET /api/v1/lineage/trace?layer=&table=&column=` | Backward lineage trace |
 | `GET /api/v1/lineage/record/{golden_id}` | Full lineage for one golden record |
 | `GET /api/v1/admin/users` | List portal users (admin role required) |
-| `POST /api/v1/admin/users` | Create a user (admin role required) |
-| `PUT /api/v1/admin/users/{user_id}` | Update role/access/status (admin role required) |
-| `POST /api/v1/admin/users/{user_id}/reset_password` | Reset a user's password (admin role required) |
+| `POST /api/v1/admin/users` | Submit a new-user request (admin role required; a different admin must approve) |
+| `PUT /api/v1/admin/users/{user_id}` | Update `full_name` immediately; `role`/`gold_access`/`is_active` changes submit for a different admin's approval |
+| `POST /api/v1/admin/users/{user_id}/reset_password` | Reset a user's password (admin role required; not gated by an approval) |
 | `GET /api/v1/stewardship/queue?status=open` | Exception queue |
 | `POST /api/v1/stewardship/queue/{id}/suggest` | Get AI/heuristic remediation suggestion |
-| `POST /api/v1/stewardship/queue/{id}/resolve` | Approve a correction |
-| `POST /api/v1/stewardship/queue/{id}/reject` | Reject a record |
+| `POST /api/v1/stewardship/queue/{id}/resolve` | Submit a correction for Data Owner approval (reprocesses once approved) |
+| `POST /api/v1/stewardship/queue/{id}/reject` | Submit a rejection for Data Owner approval |
 | `GET /api/v1/stewardship/match-review?status=pending` | Borderline fuzzy-match candidates (dataSteward/dataOwner role required) |
 | `GET /api/v1/stewardship/match-review/{pair_id}` | One match-review candidate pair, full side-by-side detail |
-| `POST /api/v1/stewardship/match-review/{pair_id}/confirm` | Confirm a pair is the same customer (merges on the next pipeline rebuild) |
-| `POST /api/v1/stewardship/match-review/{pair_id}/reject` | Reject a pair as coincidental (permanently excluded going forward) |
+| `POST /api/v1/stewardship/match-review/{pair_id}/confirm` | Submit a confirm decision for approval (Data Owner, then Admin) |
+| `POST /api/v1/stewardship/match-review/{pair_id}/reject` | Submit a reject decision for approval (Data Owner, then Admin) |
+| `GET /api/v1/workflows/pending` | Workflow instances awaiting the caller's decision |
+| `GET /api/v1/workflows/mine` | Workflow instances the caller submitted, with status |
+| `GET /api/v1/workflows/{instance_id}` | One workflow instance, full detail including decisions so far |
+| `POST /api/v1/workflows/{instance_id}/decide` | Approve or reject the current step (`{decision, comment}`) |
 
 All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints require an
 `Authorization: Bearer <token>` header from `/api/v1/auth/login`.
@@ -295,6 +324,14 @@ All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints requ
 - **Auth** is a from-scratch bcrypt + bearer-token implementation sized for a demo
   (sessions expire after 8 hours, no refresh tokens, no MFA). A production system
   would typically delegate this to an identity provider (Okta, Azure AD, etc.).
+- The **maker-checker workflow engine** only gates the four workflows above —
+  Reference Data Maintenance and Rules Configuration (planned Data Governance
+  screens) aren't built yet. If the underlying action fails after every required
+  approval is already recorded, the instance is still marked `approved` (the human
+  decision stands) with the failure captured in its `result` field rather than
+  silently rolled back — there's no automatic retry. A quorum or multi-level chain
+  also needs enough distinct people in the required role to ever clear; see
+  `scripts/create_demo_governance_users.py`.
 - The database (`mdm_demo.duckdb`) is a single local file — fine for a demo, not a
   substitute for a real concurrent multi-user warehouse.
 - **Steward-corrected records ARE re-run through the reject-severity validation

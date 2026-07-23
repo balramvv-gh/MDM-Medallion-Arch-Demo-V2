@@ -279,6 +279,7 @@
       <h1>MDM Data Hub Portal</h1>
       <nav>
         <button id="navBrowse" class="active" onclick="showView('browse')">Browse Customers</button>
+        <button id="navApprovals" onclick="showView('approvals')">Approvals</button>
         <span class="dropdown" id="govDropdown">
           <button onclick="toggleDropdown('govDropdown')">Data Governance ▾</button>
           <span class="dropdown-menu">
@@ -334,6 +335,23 @@
           <tr><th>USERNAME</th><th>FULL NAME</th><th>ROLE</th><th>GOLD ACCESS</th><th>STATUS</th><th>LAST LOGIN</th><th></th></tr>
         </thead>
         <tbody id="userRows"></tbody>
+      </table>
+    </div>
+
+    <!-- Approvals (generic maker-checker) -->
+    <div class="view" id="view-approvals">
+      <div class="toolbar">
+        <span style="font-size:15px;font-weight:700;">Approvals</span>
+        <div style="display:flex;gap:8px;margin-left:auto;">
+          <button class="btn-secondary" id="apModePending" style="padding:7px 14px;border-radius:6px;font-size:12px;" onclick="setApprovalsMode('pending')">Awaiting my decision</button>
+          <button class="btn-secondary" id="apModeMine" style="padding:7px 14px;border-radius:6px;font-size:12px;" onclick="setApprovalsMode('mine')">My submissions</button>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr><th>WORKFLOW</th><th>SUMMARY</th><th>SUBMITTED BY</th><th>STATUS / STEP</th><th></th></tr>
+        </thead>
+        <tbody id="approvalRows"></tbody>
       </table>
     </div>
 
@@ -428,6 +446,16 @@
   </div>
 </div>
 
+<!-- Approval decision modal -->
+<div class="modal-backdrop" id="approvalModal">
+  <div class="modal">
+    <button class="btn-close" onclick="closeModal('approvalModal')">×</button>
+    <h2 id="apModalTitle">Approval</h2>
+    <div id="apModalBody"></div>
+    <div class="modal-actions" id="apModalActions"></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -440,6 +468,8 @@ let currentSearch = '';
 let editingCustomer = null;
 let editingUserId = null;
 let searchDebounce = null;
+let approvalsMode = 'pending';   // 'pending' (awaiting my decision) | 'mine' (my submissions)
+let currentApprovalInstance = null;
 
 function authHeaders() {
   return { 'Authorization': `Bearer ${session.token}`, 'Content-Type': 'application/json' };
@@ -531,10 +561,12 @@ function showView(name) {
   document.getElementById(`view-${name}`).classList.add('active');
   document.getElementById('navBrowse').classList.toggle('active', name === 'browse');
   document.getElementById('navLineage').classList.toggle('active', name === 'lineage');
+  document.getElementById('navApprovals').classList.toggle('active', name === 'approvals');
   document.getElementById('adminDropdown').classList.remove('open');
   document.getElementById('govDropdown').classList.remove('open');
   if (name === 'users') loadUsers();
   if (name === 'lineage') initLineageView();
+  if (name === 'approvals') loadApprovals();
 }
 
 function toggleDropdown(id) {
@@ -636,7 +668,13 @@ async function saveCustomer() {
     method: 'PUT', headers: authHeaders(), body: JSON.stringify(body),
   });
   if (res.ok) {
-    showToast('Customer record updated.');
+    const data = await res.json();
+    if (data.status === 'pending_approval') {
+      const steps = (data.steps || []).map(s => s.step_name).join(' → ');
+      showToast(`Submitted for approval${steps ? ' (' + steps + ')' : ''}. Changes apply once both Data Owners sign off.`);
+    } else {
+      showToast('No changes to save.');
+    }
     closeModal('customerModal');
     loadCustomers();
   } else {
@@ -755,8 +793,19 @@ async function saveUser() {
       is_active: document.getElementById('uf_is_active').value === 'true',
     };
     const res = await fetch(`${API}/admin/users/${editingUserId}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify(body) });
-    if (res.ok) { showToast('User updated.'); loadUsers(); closeModal('userModal'); }
-    else showToast('Update failed.');
+    const data = await res.json();
+    if (res.ok) {
+      if (data.status === 'pending_approval') {
+        const steps = (data.steps || []).map(s => s.step_name).join(' → ');
+        showToast(`Submitted for approval${steps ? ' (' + steps + ')' : ''} — a different Admin must sign off.`);
+      } else {
+        showToast('User updated.');
+      }
+      loadUsers();
+      closeModal('userModal');
+    } else {
+      showToast(data.detail || 'Update failed.');
+    }
   } else {
     const body = {
       username: document.getElementById('uf_username').value.trim(),
@@ -768,8 +817,8 @@ async function saveUser() {
     const data = await res.json();
     if (res.ok) {
       document.getElementById('passwordReveal').style.display = 'block';
-      document.getElementById('passwordReveal').innerHTML = `User created. One-time password:<br><b>${data.temp_password}</b><br>Save this now — it will not be shown again.`;
-      loadUsers();
+      document.getElementById('passwordReveal').innerHTML =
+        `Submitted for approval. ${data.note || 'A different Admin must approve before this account is created.'}`;
     } else {
       showToast(data.detail || 'Create failed.');
     }
@@ -782,6 +831,117 @@ async function resetUserPassword() {
   if (res.ok) {
     document.getElementById('passwordReveal').style.display = 'block';
     document.getElementById('passwordReveal').innerHTML = `Password reset. New one-time password:<br><b>${data.temp_password}</b><br>Save this now — it will not be shown again.`;
+  }
+}
+
+// ---------------- Approvals (generic maker-checker) ----------------
+
+const WORKFLOW_TYPE_LABELS = {
+  stewardship_remediation: 'Exception Remediation',
+  gold_record_edit: 'Gold Record Edit',
+  match_review_confirmation: 'Match Review Confirmation',
+  user_admin_change: 'User Administration',
+};
+
+function summarizeApproval(inst) {
+  const p = inst.payload || {};
+  if (inst.workflow_type === 'stewardship_remediation') {
+    if (inst.action_type === 'resolve') {
+      const fieldStr = Object.entries(p.applied_fields || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
+      return `Resolve exception ${inst.entity_id.slice(0, 8)}… — ${fieldStr || 'no field changes'}`;
+    }
+    return `Reject exception ${inst.entity_id.slice(0, 8)}…${p.steward_note ? ' — ' + p.steward_note : ''}`;
+  }
+  if (inst.workflow_type === 'gold_record_edit') {
+    const fieldStr = Object.entries(p.updates || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
+    return `Edit golden record ${inst.entity_id} — ${fieldStr}`;
+  }
+  if (inst.workflow_type === 'match_review_confirmation') {
+    return `${inst.action_type === 'confirm' ? 'Confirm' : 'Reject'} match pair ${inst.entity_id.slice(0, 8)}…${p.steward_note ? ' — ' + p.steward_note : ''}`;
+  }
+  if (inst.workflow_type === 'user_admin_change') {
+    if (inst.action_type === 'create') return `Create user '${p.username}' (${p.role}, gold_access=${p.gold_access})`;
+    const fieldStr = Object.entries(p.updates || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
+    return `Update user ${inst.entity_id} — ${fieldStr}`;
+  }
+  return JSON.stringify(p);
+}
+
+function approvalStepLabel(inst) {
+  const step = (inst.steps || []).find(s => s.step_order === inst.current_step);
+  return step ? `${step.step_name} (step ${step.step_order} of ${inst.steps.length})` : '';
+}
+
+function setApprovalsMode(mode) {
+  approvalsMode = mode;
+  document.getElementById('apModePending').classList.toggle('btn-primary', mode === 'pending');
+  document.getElementById('apModeMine').classList.toggle('btn-primary', mode === 'mine');
+  loadApprovals();
+}
+
+async function loadApprovals() {
+  const url = approvalsMode === 'pending' ? `${API}/workflows/pending` : `${API}/workflows/mine`;
+  const res = await fetch(url, { headers: authHeaders() });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('approvalRows').innerHTML = data.items.length ? data.items.map(inst => `
+    <tr>
+      <td>${WORKFLOW_TYPE_LABELS[inst.workflow_type] || inst.workflow_type}</td>
+      <td style="font-size:12px;">${escapeXml(summarizeApproval(inst))}</td>
+      <td style="font-family:var(--mono);font-size:12px;">${escapeXml(inst.maker_label)}</td>
+      <td><span class="badge ${inst.status === 'pending' ? 'multi' : 'single'}">${inst.status === 'pending' ? approvalStepLabel(inst) : inst.status.toUpperCase()}</span></td>
+      <td>${approvalsMode === 'pending' ? `<button class="btn-secondary" style="padding:5px 10px;border-radius:5px;font-size:11px;cursor:pointer;" onclick="openApprovalModal('${inst.instance_id}')">Review</button>` : ''}</td>
+    </tr>
+  `).join('') : `<tr><td colspan="5" style="color:var(--text-dim);">${approvalsMode === 'pending' ? 'Nothing awaiting your decision.' : 'You have not submitted anything yet.'}</td></tr>`;
+}
+
+async function openApprovalModal(instanceId) {
+  const res = await fetch(`${API}/workflows/${instanceId}`, { headers: authHeaders() });
+  currentApprovalInstance = await res.json();
+  const inst = currentApprovalInstance;
+
+  document.getElementById('apModalTitle').textContent = WORKFLOW_TYPE_LABELS[inst.workflow_type] || inst.workflow_type;
+  const decisionsHtml = (inst.decisions || []).map(d => `
+    <div class="crosswalk-item"><span>${escapeXml(d.actor_label)} · step ${d.step_order}</span><span>${d.decision.toUpperCase()}${d.comment ? ' — ' + escapeXml(d.comment) : ''}</span></div>
+  `).join('') || '<div style="font-size:12px;color:var(--text-dim);">No decisions recorded yet.</div>';
+
+  document.getElementById('apModalBody').innerHTML = `
+    <div class="modal-field"><label>SUBMITTED BY</label><div style="font-size:13px;">${escapeXml(inst.maker_label)}</div></div>
+    <div class="modal-field"><label>DETAILS</label><div style="font-size:13px;">${escapeXml(summarizeApproval(inst))}</div></div>
+    <div class="modal-field"><label>${inst.status === 'pending' ? 'CURRENT STEP' : 'FINAL STATUS'}</label>
+      <div style="font-size:13px;">${inst.status === 'pending' ? approvalStepLabel(inst) : inst.status.toUpperCase()}</div></div>
+    <div class="modal-field"><label>DECISIONS SO FAR</label><div class="crosswalk-list">${decisionsHtml}</div></div>
+    ${inst.status === 'pending' ? `<div class="modal-field"><label>COMMENT (optional)</label><input type="text" id="apComment" placeholder="Add a note for the audit trail…"></div>` : ''}
+  `;
+  document.getElementById('apModalActions').innerHTML = inst.status === 'pending' ? `
+    <button class="btn-secondary" onclick="closeModal('approvalModal')">Cancel</button>
+    <button class="btn-secondary" style="border-color:var(--red) !important;color:var(--red);" onclick="decideApproval('rejected')">Reject</button>
+    <button class="btn-primary" onclick="decideApproval('approved')">Approve</button>
+  ` : `<button class="btn-secondary" onclick="closeModal('approvalModal')">Close</button>`;
+
+  document.getElementById('approvalModal').classList.add('open');
+}
+
+async function decideApproval(decision) {
+  const commentEl = document.getElementById('apComment');
+  const comment = commentEl ? (commentEl.value || null) : null;
+  const res = await fetch(`${API}/workflows/${currentApprovalInstance.instance_id}/decide`, {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({ decision, comment }),
+  });
+  const data = await res.json();
+  if (res.ok) {
+    if (decision === 'approved' && data.status === 'approved' && data.result) {
+      showToast(`Approved — workflow complete. ${data.result.temp_password ? 'One-time password: ' + data.result.temp_password : ''}`);
+    } else if (decision === 'approved') {
+      showToast(data.status === 'approved' ? 'Approved — workflow complete.' : `Approved — advanced to ${approvalStepLabel(data)}.`);
+    } else {
+      showToast('Rejected.');
+    }
+    closeModal('approvalModal');
+    loadApprovals();
+  } else {
+    showToast(data.detail || 'Could not record your decision.');
   }
 }
 

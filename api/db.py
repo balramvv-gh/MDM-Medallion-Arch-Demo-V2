@@ -18,6 +18,7 @@ def get_con():
         _ensure_match_review_tables(_con)
         _ensure_auth_tables(_con)
         _ensure_audit_tables(_con)
+        _ensure_governance_tables(_con)
     return _con
 
 
@@ -66,7 +67,7 @@ def _ensure_stewardship_tables(con):
     con.execute("""
         CREATE TABLE IF NOT EXISTS stewardship.exception_status_overrides (
             exception_id VARCHAR PRIMARY KEY,
-            remediation_status VARCHAR,
+            remediation_status VARCHAR,  -- open | in_review (submitted, awaiting maker-checker approval) | resolved | rejected
             updated_ts TIMESTAMP DEFAULT current_timestamp
         );
     """)
@@ -102,7 +103,7 @@ def _ensure_match_review_tables(con):
     con.execute("""
         CREATE TABLE IF NOT EXISTS stewardship.match_review_overrides (
             pair_id VARCHAR PRIMARY KEY,
-            status VARCHAR,             -- 'confirmed' | 'rejected'
+            status VARCHAR,             -- 'pending' | 'in_review' (submitted, awaiting maker-checker approval) | 'confirmed' | 'rejected'
             steward_note VARCHAR,
             updated_ts TIMESTAMP DEFAULT current_timestamp
         );
@@ -157,6 +158,98 @@ def _ensure_audit_tables(con):
             survivor_source_system VARCHAR, survivor_source_record_id VARCHAR
         );
     """)
+
+
+def _ensure_governance_tables(con):
+    """Generic maker-checker workflow engine tables (api/workflow_engine.py).
+
+    workflow_definitions is deliberately a plain DB table, not a dbt seed CSV
+    like column_rules.csv/matching_rules.csv -- those are batch-pipeline
+    metadata refreshed by `dbt seed`, but workflow definitions need to be
+    editable at runtime by governance users (the planned Rules Configuration
+    screen under Data Governance), so they're seeded here once and then left
+    alone on every subsequent app start -- only the first boot (empty table)
+    populates DEFAULT_WORKFLOW_DEFINITIONS below.
+
+    A workflow_type is an ordered list of steps (step_order). Each step names
+    the role allowed to decide at that step and how many distinct approvers
+    of that role are required before the step is satisfied (approvals_required
+    > 1 means a same-level quorum, e.g. 2 different Data Owners, rather than
+    sequential levels). A maker can never decide on their own submission, and
+    the same approver can never cast two decisions on one instance (no
+    double-counting toward a quorum) -- both enforced in workflow_engine.py,
+    not here."""
+    con.execute("CREATE SCHEMA IF NOT EXISTS governance;")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS governance.workflow_definitions (
+            workflow_type VARCHAR,
+            step_order INTEGER,
+            step_name VARCHAR,
+            required_role VARCHAR,       -- 'admin' | 'dataSteward' | 'dataOwner' | 'businessUser'
+            approvals_required INTEGER,  -- distinct approvers of required_role needed to clear this step
+            is_active BOOLEAN DEFAULT true,
+            PRIMARY KEY (workflow_type, step_order)
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS governance.workflow_instances (
+            instance_id VARCHAR PRIMARY KEY,
+            workflow_type VARCHAR,
+            entity_type VARCHAR,     -- 'exception' | 'gold_customer' | 'match_pair' | 'user'
+            entity_id VARCHAR,
+            action_type VARCHAR,     -- 'resolve' | 'reject' | 'update' | 'confirm' | 'create' ...
+            payload VARCHAR,         -- JSON: whatever the executor needs to apply the change on approval
+            maker_user_id VARCHAR,
+            maker_label VARCHAR,
+            status VARCHAR,          -- 'pending' | 'approved' | 'rejected'
+            current_step INTEGER,
+            created_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_ts TIMESTAMP DEFAULT current_timestamp,
+            completed_ts TIMESTAMP,
+            result VARCHAR           -- JSON: outcome of the executor once the workflow completes (or an error note)
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS governance.workflow_decisions (
+            decision_id VARCHAR PRIMARY KEY,
+            instance_id VARCHAR,
+            step_order INTEGER,
+            actor_user_id VARCHAR,
+            actor_label VARCHAR,
+            decision VARCHAR,        -- 'approved' | 'rejected'
+            comment VARCHAR,
+            decided_ts TIMESTAMP DEFAULT current_timestamp
+        );
+    """)
+
+    existing = con.execute("SELECT COUNT(*) FROM governance.workflow_definitions").fetchone()[0]
+    if existing == 0:
+        for row in DEFAULT_WORKFLOW_DEFINITIONS:
+            con.execute("""
+                INSERT INTO governance.workflow_definitions
+                    (workflow_type, step_order, step_name, required_role, approvals_required, is_active)
+                VALUES (?, ?, ?, ?, ?, true)
+            """, row)
+
+
+# Seeded once, on first boot with an empty workflow_definitions table. See
+# _ensure_governance_tables' docstring for why this isn't a dbt seed CSV.
+DEFAULT_WORKFLOW_DEFINITIONS = [
+    # Data Stewardship: exception-queue resolve/reject. 1 level, 1 Data Owner.
+    ("stewardship_remediation", 1, "Data Owner review", "dataOwner", 1),
+
+    # Customer Portal: inline gold-record edit. 1 level, quorum of 2 Data Owners
+    # (two different Data Owners must both sign off; not sequential levels).
+    ("gold_record_edit", 1, "Data Owner quorum (2 of 2)", "dataOwner", 2),
+
+    # Data Stewardship: Match Review confirm/reject. 2 sequential levels.
+    ("match_review_confirmation", 1, "Data Owner review", "dataOwner", 1),
+    ("match_review_confirmation", 2, "Admin sign-off", "admin", 1),
+
+    # User Administration: create user, or update role/gold_access/is_active.
+    # 1 level, 1 Admin (must be a different admin than whoever made the request).
+    ("user_admin_change", 1, "Admin sign-off", "admin", 1),
+]
 
 
 def run_query(sql, params=None):
