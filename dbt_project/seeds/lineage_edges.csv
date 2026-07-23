@@ -11,17 +11,18 @@ E009,bronze,erp_customers_raw,email_addr,silver,silver_customers,email,R010,Lowe
 E010,bronze,erp_customers_raw,contact_phone,silver,silver_customers,phone,R015,Standardized to +1 E.164-style format
 E011,bronze,erp_customers_raw,state_code,silver,silver_customers,state_code,R012,Validated against ref_state_codes
 E012,bronze,erp_customers_raw,country_code,silver,silver_customers,country_code,R013,Validated against ref_country_codes
-E013,silver,silver_customers,email,gold_prep,match_groups,match_group_id,MATCH01,"Tier 1: exact match on normalized email (scripts/generate_matches.py)"
-E014,silver,silver_customers,phone,gold_prep,match_groups,match_group_id,MATCH01,"Tier 1: exact match on normalized phone (scripts/generate_matches.py)"
+E013,silver,silver_customers,email,gold_prep,match_groups,match_group_id,MR001,"Tier 1: exact_match_field rule (matching_rules.csv) -- normalized email (scripts/generate_matches.py)"
+E014,silver,silver_customers,phone,gold_prep,match_groups,match_group_id,MR002,"Tier 1: exact_match_field rule (matching_rules.csv) -- normalized phone (scripts/generate_matches.py)"
 E015,gold,gold_match_candidates,*,gold,gold_customers,*,SURV01,Record-level survivorship: most recently modified source wins
 E016,gold,gold_match_candidates,*,gold,gold_crosswalk,*,SURV01,Every contributing source record retained with confidence score
 E017,silver,exceptions_queue,*,stewardship_app,remediation_log,*,STEW01,Steward-reviewed corrections re-enter the pipeline at silver
-E018,gold_prep,match_edges,confidence,gold,gold_crosswalk,match_confidence_score,CONF01,"Edge confidence (1.00 exact, or the cosine similarity score for a fuzzy match) becomes the crosswalk's match_confidence_score"
+E018,gold_prep,match_edges,confidence,gold,gold_crosswalk,match_confidence_score,CONF01,"Edge confidence (tier 1's auto_merge_threshold for an exact match, or the cosine similarity score for a fuzzy match -- see matching_thresholds.csv) becomes the crosswalk's match_confidence_score"
 E019,gold_prep,match_review_candidates,*,gold,gold_match_review_queue,*,REVIEW01,Borderline fuzzy-match pairs surfaced for a data steward to confirm or reject
-E020,silver,silver_customers,first_name,gold_prep,match_groups,match_group_id,MATCH02,"Tier 2: combined into TF-IDF character n-gram embedding text for fuzzy similarity scoring"
-E021,silver,silver_customers,last_name,gold_prep,match_groups,match_group_id,MATCH02,"Tier 2: combined into TF-IDF character n-gram embedding text for fuzzy similarity scoring"
-E022,silver,silver_customers,address_line1,gold_prep,match_groups,match_group_id,MATCH02,"Tier 2: combined into TF-IDF character n-gram embedding text for fuzzy similarity scoring"
-E023,silver,silver_customers,city,gold_prep,match_groups,match_group_id,MATCH02,"Tier 2: combined into TF-IDF character n-gram embedding text for fuzzy similarity scoring"
-E024,silver,silver_customers,state_code,gold_prep,match_groups,match_group_id,MATCH02,"Blocking key: candidate pairs are only compared within the same state_code, to avoid O(n^2) comparisons at scale"
+E020,silver,silver_customers,first_name,gold_prep,match_groups,match_group_id,MR003,"Tier 2: similarity_text_field rule (matching_rules.csv) -- combined into TF-IDF character n-gram embedding text for fuzzy similarity scoring"
+E021,silver,silver_customers,last_name,gold_prep,match_groups,match_group_id,MR004,"Tier 2: similarity_text_field rule (matching_rules.csv) -- combined into TF-IDF character n-gram embedding text for fuzzy similarity scoring"
+E022,silver,silver_customers,address_line1,gold_prep,match_groups,match_group_id,MR005,"Tier 2: similarity_text_field rule (matching_rules.csv) -- combined into TF-IDF character n-gram embedding text for fuzzy similarity scoring"
+E023,silver,silver_customers,city,gold_prep,match_groups,match_group_id,MR007,"Tier 2: similarity_text_field rule (matching_rules.csv) -- combined into TF-IDF character n-gram embedding text for fuzzy similarity scoring"
+E024,silver,silver_customers,state_code,gold_prep,match_groups,match_group_id,MR008,"Tier 2: blocking_key rule (matching_rules.csv) -- candidate pairs are only compared within the same blocking key value, to avoid O(n^2) comparisons at scale"
 E025,gold_prep,match_groups,match_group_id,gold,gold_match_candidates,match_group_id,MATCH00,Match group assignment attached to each silver record
 E026,gold,gold_match_review_queue,*,stewardship_app,match_review_overrides,*,STEW02,"A steward's confirm/reject decision is recorded here; honored as a forced-merge (or permanent exclusion) on the next matching run"
+E027,silver,silver_customers,address_line2,gold_prep,match_groups,match_group_id,MR006,"Tier 2: similarity_text_field rule (matching_rules.csv) -- combined into TF-IDF character n-gram embedding text for fuzzy similarity scoring (optional field, blank treated as empty string)"

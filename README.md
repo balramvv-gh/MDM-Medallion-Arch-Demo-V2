@@ -11,8 +11,11 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
 - **Silver layer** — cleansing, standardization, and validation driven entirely by
   **metadata** (`dbt_project/seeds/column_rules.csv`), not hardcoded logic. Records
   that fail validation are routed to an exception queue instead of the pipeline.
-- **Gold layer (Data Hub)** — hybrid match/merge across source systems:
-  deterministic exact matching on normalized email/phone, plus an
+- **Gold layer (Data Hub)** — hybrid match/merge across source systems, **entirely
+  metadata-driven**: tiers and thresholds live in `dbt_project/seeds/matching_thresholds.csv`,
+  and the columns each tier compares live in `dbt_project/seeds/matching_rules.csv` — the
+  same "rules live in a seed, not in code" pattern as `column_rules.csv`. Today's seed
+  configures deterministic exact matching on normalized email/phone, plus an
   **embedding-similarity (fuzzy) tier** that catches near-duplicates exact
   matching misses (typos, nicknames, reformatted addresses) via TF-IDF
   character n-gram cosine similarity, computed in `scripts/generate_matches.py`
@@ -20,8 +23,10 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
   borderline ones go to a **Match Review queue** for a data steward to confirm
   or reject. Record-level survivorship and a **crosswalk table** preserve the
   link between every golden record and its contributing source records, with
-  a graduated match confidence score (1.00 for exact, the actual similarity
-  score for fuzzy, 0.50 "provisional" for uncorroborated single-source records).
+  a graduated match confidence score (that tier's `auto_merge_threshold` for exact,
+  the actual similarity score for fuzzy, and a seeded 0.50 "provisional" baseline
+  for uncorroborated single-source records) — all sourced from the seed, not
+  hardcoded literals.
 - **Data Stewardship app** (`/app/`) — restricted to `dataSteward` / `dataOwner`
   accounts, two tabs: an **Exception Queue** console for reviewing rejected records,
   getting an AI-assisted remediation suggestion (Claude, with a heuristic fallback
@@ -255,22 +260,32 @@ All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints requ
 
 ## Design notes / known simplifications (by design, for demo scope)
 
-- **Matching** is a hybrid of deterministic exact matching (normalized email or
-  phone, confidence 1.00) and an embedding-similarity fuzzy tier (TF-IDF
+- **Matching is metadata-driven**, the same pattern as `column_rules.csv`: tier
+  definitions and thresholds live in `dbt_project/seeds/matching_thresholds.csv`,
+  and the fields each tier compares live in `dbt_project/seeds/matching_rules.csv`
+  (a child table keyed by tier_id). Nothing about *which* fields matter or *what*
+  threshold counts as a match is hardcoded in `scripts/generate_matches.py` or
+  `api/reprocessing.py` — both read the seed at runtime. Today's seed configures a
+  hybrid of deterministic exact matching (normalized email or phone, confidence =
+  that tier's `auto_merge_threshold`) and an embedding-similarity fuzzy tier (TF-IDF
   character n-gram cosine similarity over name/address text, blocked by
-  state_code). Fuzzy matches above a calibrated high threshold auto-merge with
-  their similarity score as confidence; borderline ones go to a **Match
-  Review** queue for a steward to confirm or reject rather than auto-merging.
-  This is a real embedding-similarity technique used in production dedup
-  systems, deliberately kept lightweight (no model download, fully offline,
-  no GPU) rather than a neural sentence-embedding model — a reasonable next
-  iteration if higher recall on more subtle near-duplicates is needed. See
-  `scripts/generate_matches.py` for the full algorithm and calibration notes.
+  state_code). Fuzzy matches above the seed's `auto_merge_threshold` auto-merge with
+  their similarity score as confidence; matches between `review_lower_threshold` and
+  `auto_merge_threshold` go to a **Match Review** queue for a steward to confirm or
+  reject rather than auto-merging. This is a real embedding-similarity technique used
+  in production dedup systems, deliberately kept lightweight (no model download,
+  fully offline, no GPU) rather than a neural sentence-embedding model — a
+  reasonable next iteration if higher recall on more subtle near-duplicates is
+  needed. See `scripts/generate_matches.py` for the full algorithm and calibration
+  notes, and `dbt_project/seeds/matching_thresholds.csv` /
+  `matching_rules.csv` for the tier/field configuration itself.
   **Known gap:** the real-time reprocessing path (steward resolves a
-  validation exception → immediate re-match) still only does exact matching;
-  the fuzzy tier only runs in the batch pipeline. Fitting a TF-IDF vectorizer
-  per API request was judged not worth the added request latency for a
-  demo-scoped feature.
+  validation exception → immediate re-match) still only evaluates the exact
+  (`match_method='exact'`) tier; the fuzzy tier only runs in the batch pipeline.
+  Fitting a TF-IDF vectorizer per API request was judged not worth the added
+  request latency for a demo-scoped feature. Both paths read the same
+  `exact_match_field` rules, though, so they can't disagree on which fields
+  count as an exact match.
 - **Survivorship** is record-level (most-recently-modified source wins for the
   whole record), not attribute-level — a natural next iteration.
 - Rules are documented as metadata (`column_rules.csv`) and referenced by rule ID

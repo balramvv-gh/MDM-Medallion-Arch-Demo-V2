@@ -1,0 +1,9 @@
+rule_id,tier_id,rule_role,rule_order,source_column,transform_function,active,description
+MR001,MT001,exact_match_field,1,email,normalize_email,true,"Normalized (trimmed, lowercased) email must match exactly"
+MR002,MT001,exact_match_field,2,phone,normalize_phone,true,Normalized (digits-only) phone must match exactly
+MR003,MT002,similarity_text_field,1,first_name,none,true,Included in the concatenated text used for TF-IDF similarity scoring
+MR004,MT002,similarity_text_field,2,last_name,none,true,Included in the concatenated text used for TF-IDF similarity scoring
+MR005,MT002,similarity_text_field,3,address_line1,none,true,Included in the concatenated text used for TF-IDF similarity scoring
+MR006,MT002,similarity_text_field,4,address_line2,none,true,"Included in the concatenated text used for TF-IDF similarity scoring (optional field, blank treated as empty string)"
+MR007,MT002,similarity_text_field,5,city,none,true,Included in the concatenated text used for TF-IDF similarity scoring
+MR008,MT002,blocking_key,1,state_code,none,true,"Candidate pairs are only compared within the same blocking key value, to avoid O(n^2) comparisons at scale. Deliberately excludes email/phone from tier 2 entirely -- those are exactly the fields tier 2 exists to catch disagreement on."

@@ -21,19 +21,29 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   **metadata-driven**: rules live in `dbt_project/seeds/column_rules.csv` (rule_id, source
   column, rule_type, severity), not hardcoded in pipeline code. Records failing validation
   route to an exception queue instead of silver.
-- **Gold (Data Hub)** — hybrid match/merge across sources: tier 1 is deterministic exact
-  match on normalized email OR phone (confidence 1.00); tier 2 is an embedding-similarity
-  fuzzy match (TF-IDF character n-gram cosine similarity over name/address text, blocked
-  by state_code) that catches near-duplicates tier 1 misses. High-confidence fuzzy matches
-  auto-merge with their similarity score as confidence; borderline ones surface in a
-  **Match Review queue** for a data steward to confirm or reject rather than auto-merging.
-  Computed in `scripts/generate_matches.py`, which runs as a Python step between silver
-  and gold (dbt-duckdb can't do the embedding math in SQL) and writes to a `gold_prep`
-  schema that the gold dbt models consume as a source — same "Python loads, dbt treats it
-  as a source" pattern already used for bronze. Record-level survivorship
-  (most-recently-modified source wins, CRM preferred as tiebreak) and a **crosswalk table**
-  preserve the relationship between every golden record and its contributing source
-  records, with a graduated match confidence score.
+- **Gold (Data Hub)** — hybrid match/merge across sources, and **fully metadata-driven**:
+  tier definitions/thresholds live in `dbt_project/seeds/matching_thresholds.csv` and the
+  fields/columns each tier operates on live in `dbt_project/seeds/matching_rules.csv` (a
+  child table keyed by tier_id) — nothing about *what* matches is hardcoded in pipeline
+  code, mirroring the same pattern `column_rules.csv` already established for silver
+  validation. Today's seed configures two tiers: tier 1 is deterministic exact match on
+  normalized email OR phone (confidence = that tier's `auto_merge_threshold`, 1.00); tier 2
+  is an embedding-similarity fuzzy match (TF-IDF character n-gram cosine similarity over
+  name/address text, blocked by state_code) that catches near-duplicates tier 1 misses.
+  High-confidence fuzzy matches auto-merge with their similarity score as confidence;
+  borderline ones surface in a **Match Review queue** for a data steward to confirm or
+  reject rather than auto-merging. A third, non-tier seed row (`is_match_tier=false`)
+  holds the 0.50 "provisional" baseline confidence assigned to a single-source golden
+  record with no corroborating match at all — read by both the batch gold layer and
+  real-time reprocessing, so they can't disagree on it. Computed in
+  `scripts/generate_matches.py`, which runs as a Python step between silver and gold
+  (dbt-duckdb can't do the embedding math in SQL) and writes to a `gold_prep` schema that
+  the gold dbt models consume as a source — same "Python loads, dbt treats it as a source"
+  pattern already used for bronze. Record-level survivorship (most-recently-modified
+  source wins, CRM preferred as tiebreak) and a **crosswalk table** preserve the
+  relationship between every golden record and its contributing source records, with a
+  graduated match confidence score also sourced from the seed (`gold_crosswalk.sql`,
+  not hardcoded literals).
 
 ## Tech stack
 
@@ -65,8 +75,10 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
      transparent heuristic fallback when no key is set — every suggestion response includes
      `source: "ai"` or `"heuristic_fallback"`), and approves/rejects corrections. **Approving
      a correction triggers real-time reprocessing**: the corrected record is upserted into
-     silver, matched (exact tier only, see known simplifications) against the current gold set,
-     and survivorship is re-run to either update the matched golden record or create a new one.
+     silver, matched against the current gold set using the same tier-1 exact_match_field
+     rules from `matching_rules.csv` the batch pipeline reads (exact tier only, see known
+     simplifications), and survivorship is re-run to either update the matched golden
+     record or create a new one.
      This mirrors the batch dbt logic so both paths stay consistent, though golden ID numbering
      can diverge between them (documented limitation).
    - **Match Review** — borderline fuzzy-match candidates from the gold layer's
@@ -137,6 +149,21 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   when the match/merge step moved into `gold_prep` (matching layer is now `gold_prep`,
   edges E013/E014/E018-E026 cover it; re-verify with `/api/v1/lineage/impact` and
   `/trace` after touching this file, don't just eyeball it).
+- `dbt_project/seeds/matching_thresholds.csv` — one row per matching tier (tier_id,
+  tier_order, tier_name, match_method, is_match_tier, auto_merge_threshold,
+  review_lower_threshold, active, description). `match_method` is `'exact'` or
+  `'fuzzy_tfidf_cosine'` today; a non-tier row (`is_match_tier=false`,
+  `match_method='no_match_baseline'`) holds the 0.50 provisional-confidence value.
+  Adding a tier means adding a row here (plus its rules below) — nothing in
+  `scripts/generate_matches.py` or `api/reprocessing.py` needs to change to add another
+  exact or fuzzy tier, only to add a genuinely new match_method.
+- `dbt_project/seeds/matching_rules.csv` — child table keyed by `tier_id`, one row per
+  field/column a tier operates on (rule_role is `exact_match_field`, `similarity_text_field`,
+  or `blocking_key`; `transform_function` is `none`/`normalize_email`/`normalize_phone`,
+  applied identically in both Python (`scripts/generate_matches.py`, `api/reprocessing.py`)
+  and SQL (`gold_crosswalk.sql`'s tier lookups) via matching name-keyed registries). Multiple
+  `blocking_key` rows for one tier compose into a multi-column blocking key;
+  `rule_order` controls concatenation order for `similarity_text_field` rows.
 - `gold_prep.match_groups` / `match_edges` / `match_review_candidates` — written by
   `scripts/generate_matches.py` (not dbt-built), same "Python loads, dbt treats it as a
   source" pattern as bronze. `match_edges` is the audit trail dbt joins to compute
@@ -167,14 +194,22 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 
 - Fuzzy matching only runs in the batch pipeline (`scripts/generate_matches.py`).
   Real-time reprocessing (steward resolves an exception → immediate re-match) still only
-  does exact email/phone matching -- fitting a TF-IDF vectorizer per API request was judged
-  not worth the latency for a demo-scoped feature. A confirmed/rejected Match Review
-  decision similarly only takes effect on the next batch rebuild, not instantly.
+  evaluates the `match_method='exact'` tier -- fitting a TF-IDF vectorizer per API request
+  was judged not worth the latency for a demo-scoped feature. Both paths read the same
+  `exact_match_field` rules from `matching_rules.csv`, so they can't drift on *which*
+  fields count as an exact match, even though only the batch step can also run a fuzzy
+  tier. A confirmed/rejected Match Review decision similarly only takes effect on the
+  next batch rebuild, not instantly.
 - The fuzzy tier is TF-IDF character n-gram cosine similarity, not a neural sentence
-  embedding -- a deliberate lightweight choice (see Tech stack). Thresholds (TAU_HIGH=0.80
-  auto-merge, TAU_LOW=0.35 review floor) were calibrated empirically against this project's
-  synthetic data generator's 12 seeded fuzzy-duplicate pairs vs. every same-state
-  non-duplicate pair; re-calibrate if the generator's population changes materially.
+  embedding -- a deliberate lightweight choice (see Tech stack); the vectorizer's shape
+  (char_wb analyzer, 2-4 char n-grams) is a fixed code constant in `generate_matches.py`,
+  not seed metadata. Thresholds (0.80 auto-merge, 0.35 review floor today) live in
+  `matching_thresholds.csv`'s `auto_merge_threshold`/`review_lower_threshold` columns for
+  the fuzzy tier row, not hardcoded constants -- change the seed value and rerun to
+  recalibrate, no code edit needed. Original calibration was empirical, against this
+  project's synthetic data generator's 12 seeded fuzzy-duplicate pairs vs. every
+  same-state non-duplicate pair; re-calibrate (and update the seed) if the generator's
+  population changes materially.
 - Survivorship is record-level (whole record from one winning source), not attribute-level.
 - Steward corrections ARE re-validated against the reject-severity metadata rules
   (`api/validation.py`, mirroring `column_rules.csv`) before reprocessing runs — a
@@ -206,7 +241,9 @@ scripts/                load_bronze.py, generate_matches.py (fuzzy match/merge, 
                         between silver and gold), build_pipeline.py (runs the 5-stage build),
                         audit_pipeline_diff.py (gold-layer audit trail diff, final build
                         step), create_admin_user.py, reset_admin_password.py
-dbt_project/            seeds (rules/reference/lineage metadata), models (silver, gold);
+dbt_project/            seeds (rules/reference/lineage/matching metadata -- column_rules.csv,
+                        matching_thresholds.csv, matching_rules.csv, lineage_edges.csv,
+                        ref_state_codes.csv, ref_country_codes.csv), models (silver, gold);
                         gold reads scripts/generate_matches.py's output via the gold_prep source
 api/                    FastAPI app: main.py, db.py, auth.py, reprocessing.py,
                         lineage.py, ai_remediation.py, audit.py (gold-layer audit trail)
@@ -239,3 +276,16 @@ README.md               Windows-first setup instructions (PowerShell), plus macO
   one case where an untested "fix" (a bad dependency pin, a missing `pandas` requirement,
   a broken lineage chain) shipped and had to be caught and corrected afterward.
 - Windows portability matters for every file-path change — no hardcoded absolute paths.
+- **Every time a fix or enhancement is successfully tested, update documentation and push
+  to GitHub as part of finishing the task, not as a separate follow-up:** update this file
+  (`PROJECT_KNOWLEDGE.md`), `README.md`, and the relevant `.docx` deliverables (at minimum
+  `Design_Document.docx`; also `Enterprise_Readiness_Assessment.docx` and the
+  `Installation_Guide_*.docx` files if the change affects them) so they describe the
+  change, then `git add` / `git commit` / `git push` to `origin/main`
+  (`https://github.com/balramvv-gh/MDM-Medallion-Arch-Demo-V2.git`). Check `git status`
+  and `git log main..origin/main` first — this repo has previously accumulated uncommitted
+  local changes and un-pulled remote commits from other sessions/machines; reconcile
+  (`git fetch`, `git merge --ff-only origin/main` or resolve conflicts) before adding new
+  work on top, rather than committing blind. Network access to github.com from a sandboxed
+  session has been intermittent (occasional `502`/`403` from the proxy) but has succeeded
+  on retry every time so far — retry a few times before concluding the push isn't possible.

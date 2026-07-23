@@ -11,8 +11,11 @@ When a steward's correction passes re-validation, this module:
   1. Upserts the corrected record into the silver layer (main_silver.silver_customers) --
      it is now treated as canonical, on the strength of having passed re-validation.
   2. Matches the corrected record against the CURRENT set of golden records, using the
-     same deterministic strategy as the batch dbt gold_match_candidates model
-     (normalized email OR normalized phone).
+     tier-1 (exact_match_field) rules from main_rules.matching_rules -- the same
+     metadata the batch dbt gold_match_candidates model's tier 1 reads (today:
+     normalized email OR normalized phone, see dbt_project/seeds/matching_rules.csv).
+     Confidence for a tier-1 match is that tier's auto_merge_threshold, read from
+     main_rules.matching_thresholds -- not a hardcoded literal.
   3. Runs survivorship:
        - If matched: recomputes the survivor across the whole contributing group
          (most-recently-modified source wins, CRM preferred as tiebreak) and updates
@@ -27,6 +30,15 @@ Design notes / known simplifications (consistent with the rest of this demo):
     those are cosmetic and don't gate silver eligibility in the batch pipeline
     either. A steward's sign-off on a now-valid record is still what makes the
     correction authoritative; the record just has to actually be valid first.
+  - Matching is metadata-driven: the exact_match_field rows for the 'exact'
+    tier in main_rules.matching_rules determine which columns are compared
+    (and how each is normalized, via that rule's transform_function) -- see
+    _load_tier1_matching_metadata() below. This module only ever evaluates
+    the 'exact' tier; a 'fuzzy_tfidf_cosine' tier (if any) is intentionally
+    skipped here -- fitting a TF-IDF vectorizer per API request would be a
+    real latency/complexity cost for a demo-scoped real-time path. This is
+    the same documented divergence as before, just no longer duplicated as
+    hardcoded email/phone logic that could drift from the batch script.
   - The corrected record's "modified" timestamp is stamped as the moment of
     correction. Combined with the recency-wins survivorship rule, this means a fresh
     steward correction will typically become the new survivor -- which is usually the
@@ -49,13 +61,65 @@ import pandas as pd
 from db import run_query, run_write
 import audit as audit_mod
 
+# Same transform_function registry as scripts/generate_matches.py (Python-side
+# values). SQL_TRANSFORMS below is the equivalent for building the WHERE
+# clause against DuckDB directly -- kept alongside deliberately so both stay
+# in lockstep as new transform_function values are added to matching_rules.csv.
+PY_TRANSFORMS = {
+    "none": lambda v: v,
+    "normalize_email": lambda v: (v or "").strip().lower(),
+    "normalize_phone": lambda v: re.sub(r"[^0-9]", "", v or ""),
+}
 
-def _normalize_email(email):
-    return (email or "").strip().lower()
+SQL_TRANSFORMS = {
+    "none": lambda col: col,
+    "normalize_email": lambda col: f"lower(trim({col}))",
+    "normalize_phone": lambda col: f"regexp_replace(coalesce({col},''), '[^0-9]', '', 'g')",
+}
 
 
-def _normalize_phone(phone):
-    return re.sub(r"[^0-9]", "", phone or "")
+def _load_tier1_matching_metadata():
+    """Reads the active 'exact' tier from main_rules.matching_thresholds and its
+    exact_match_field rules from main_rules.matching_rules. Raises if no active
+    exact tier is configured -- this module has nothing meaningful to do
+    without one."""
+    tiers = run_query("""
+        SELECT * FROM main_rules.matching_thresholds
+        WHERE active AND is_match_tier AND match_method = 'exact'
+        ORDER BY tier_order
+    """)
+    if tiers.empty:
+        raise RuntimeError(
+            "No active tier with match_method='exact' found in "
+            "main_rules.matching_thresholds -- real-time reprocessing has no "
+            "matching rule to apply."
+        )
+    tier1 = tiers.iloc[0]
+
+    rules = run_query("""
+        SELECT * FROM main_rules.matching_rules
+        WHERE active AND tier_id = ? AND rule_role = 'exact_match_field'
+        ORDER BY rule_order
+    """, [tier1["tier_id"]])
+
+    return float(tier1["auto_merge_threshold"]), rules.to_dict(orient="records")
+
+
+def _load_baseline_confidence():
+    """Reads the non-tier 'no_match_baseline' row from main_rules.matching_thresholds
+    -- the confidence assigned to a golden record with no corroborating match at
+    all (single source, e.g. a brand-new record created by this module when no
+    existing golden record matched). Mirrors the batch gold_crosswalk.sql fallback
+    for the identical situation, so the two paths can't drift on this value."""
+    baseline = run_query("""
+        SELECT * FROM main_rules.matching_thresholds
+        WHERE active AND NOT is_match_tier AND match_method = 'no_match_baseline'
+    """)
+    if baseline.empty:
+        raise RuntimeError(
+            "No active 'no_match_baseline' row found in main_rules.matching_thresholds."
+        )
+    return float(baseline.iloc[0]["auto_merge_threshold"])
 
 
 def _epoch(dt):
@@ -94,25 +158,42 @@ def reprocess_corrected_record(record: dict, actor: dict = None) -> dict:
           record.get("address_line2"), record.get("city"), record.get("state_code"),
           record.get("postal_code"), record.get("country_code"), now, now, now])
 
-    # --- (b) Match against the current gold set ------------------------------
-    match_email = _normalize_email(record.get("email"))
-    match_phone = _normalize_phone(record.get("phone"))
+    # --- (b) Match against the current gold set, using tier-1 exact_match_field
+    # rules from main_rules.matching_rules (see _load_tier1_matching_metadata) --
+    tier1_confidence, exact_rules = _load_tier1_matching_metadata()
 
-    matched = run_query("""
-        SELECT DISTINCT golden_id FROM main_gold.gold_customers
-        WHERE (? != '' AND lower(trim(email)) = ?)
-           OR (? != '' AND regexp_replace(coalesce(phone,''), '[^0-9]', '', 'g') = ?)
-    """, [match_email, match_email, match_phone, match_phone])
+    conditions, params = [], []
+    for rule in exact_rules:
+        col = rule["source_column"]
+        transform = rule["transform_function"] or "none"
+        sql_col = SQL_TRANSFORMS.get(transform, SQL_TRANSFORMS["none"])(col)
+        val = PY_TRANSFORMS.get(transform, PY_TRANSFORMS["none"])(record.get(col))
+        conditions.append(f"(? != '' AND {sql_col} = ?)")
+        params += [val, val]
+
+    matched = pd.DataFrame()
+    if conditions:
+        where_clause = " OR ".join(conditions)
+        matched = run_query(
+            f"SELECT DISTINCT golden_id FROM main_gold.gold_customers WHERE {where_clause}",
+            params,
+        )
 
     # --- (c) Survivorship: update existing golden record, or create a new one --
     if not matched.empty:
         golden_id = matched.iloc[0]["golden_id"]
-        return _update_existing_golden_record(golden_id, source_system, source_record_id, record, now, actor)
+        return _update_existing_golden_record(golden_id, source_system, source_record_id, record, now, tier1_confidence, actor)
     else:
-        return _create_new_golden_record(source_system, source_record_id, record, now, actor)
+        # No existing golden record matched -- this source becomes its own new
+        # golden record with no corroboration, so it gets the no-match baseline
+        # confidence (main_rules.matching_thresholds, match_method='no_match_baseline'),
+        # not the tier-1 confidence -- consistent with the batch gold_crosswalk.sql
+        # fallback for the identical single-source situation.
+        baseline_confidence = _load_baseline_confidence()
+        return _create_new_golden_record(source_system, source_record_id, record, now, baseline_confidence, actor)
 
 
-def _create_new_golden_record(source_system, source_record_id, record, now, actor=None) -> dict:
+def _create_new_golden_record(source_system, source_record_id, record, now, new_record_confidence, actor=None) -> dict:
     golden_id = _next_golden_id()
 
     run_write("""
@@ -129,8 +210,8 @@ def _create_new_golden_record(source_system, source_record_id, record, now, acto
     run_write("""
         INSERT INTO main_gold.gold_crosswalk
             (golden_id, source_system, source_record_id, match_confidence_score, is_survivor_record, crosswalk_created_ts)
-        VALUES (?, ?, ?, 1.00, true, ?)
-    """, [golden_id, source_system, source_record_id, now])
+        VALUES (?, ?, ?, ?, true, ?)
+    """, [golden_id, source_system, source_record_id, new_record_confidence, now])
 
     new_row = run_query("SELECT * FROM main_gold.gold_customers WHERE golden_id = ?", [golden_id]).iloc[0].to_dict()
     audit_mod.log_creation(
@@ -149,7 +230,7 @@ def _create_new_golden_record(source_system, source_record_id, record, now, acto
     }
 
 
-def _update_existing_golden_record(golden_id, source_system, source_record_id, record, now, actor=None) -> dict:
+def _update_existing_golden_record(golden_id, source_system, source_record_id, record, now, tier1_confidence, actor=None) -> dict:
     old_row_df = run_query("SELECT * FROM main_gold.gold_customers WHERE golden_id = ?", [golden_id])
     old_record = old_row_df.iloc[0].to_dict() if not old_row_df.empty else {}
 
@@ -218,8 +299,8 @@ def _update_existing_golden_record(golden_id, source_system, source_record_id, r
         run_write("""
             INSERT INTO main_gold.gold_crosswalk
                 (golden_id, source_system, source_record_id, match_confidence_score, is_survivor_record, crosswalk_created_ts)
-            VALUES (?, ?, ?, 1.00, ?, ?)
-        """, [golden_id, c["source_system"], c["source_record_id"], is_surv, now])
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, [golden_id, c["source_system"], c["source_record_id"], tier1_confidence, is_surv, now])
 
     new_source_is_survivor = (survivor["source_system"] == source_system
                                and survivor["source_record_id"] == source_record_id)

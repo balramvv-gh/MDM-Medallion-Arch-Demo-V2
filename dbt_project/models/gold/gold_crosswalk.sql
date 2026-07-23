@@ -2,11 +2,17 @@
 -- every source record that contributed to a golden record has a row here,
 -- with a match confidence score and a flag for which record was the survivor.
 --
--- Confidence score is now genuinely graduated (see scripts/generate_matches.py):
---   1.00            -- connected to another group member via an exact email/phone match (tier 1)
---   <similarity>     -- connected via the fuzzy embedding tier (tier 2), auto-merged or
---                        steward-confirmed -- the actual cosine similarity score, typically 0.80-1.00
---   0.50            -- single-source record, no corroborating match at all ("provisional")
+-- Confidence score is genuinely graduated (see scripts/generate_matches.py),
+-- and every value below is read from the matching_thresholds seed rather than
+-- hardcoded, so the crosswalk can't drift from the same metadata the batch
+-- matching step and the real-time reprocessing path (api/reprocessing.py) use:
+--   tier 1's auto_merge_threshold  -- connected to another group member via an
+--                                      exact-match tier (e.g. email/phone)
+--   <similarity>                   -- connected via a fuzzy tier, auto-merged or
+--                                      steward-confirmed -- the actual cosine
+--                                      similarity score, typically 0.80-1.00
+--   no_match_baseline's value       -- single-source record, no corroborating
+--                                      match at all ("provisional")
 with candidates as (
     select * from {{ ref('gold_match_candidates') }}
 ),
@@ -33,13 +39,40 @@ edge_confidence as (
         select source_system_b as source_system, source_record_id_b as source_record_id, confidence from edges
     )
     group by source_system, source_record_id
+),
+
+-- Single-row lookups from the matching_thresholds seed for the two fallback
+-- confidence values (used only when a record has no edge at all touching it --
+-- see the comment on the coalesce below).
+tier1_fallback as (
+    select auto_merge_threshold as confidence
+    from {{ ref('matching_thresholds') }}
+    where active and is_match_tier and match_method = 'exact'
+    order by tier_order limit 1
+),
+
+baseline_fallback as (
+    select auto_merge_threshold as confidence
+    from {{ ref('matching_thresholds') }}
+    where active and not is_match_tier and match_method = 'no_match_baseline'
+    limit 1
 )
 
 select
     'GOLD-' || lpad(cast(c.match_group_id as varchar), 5, '0') as golden_id,
     c.source_system,
     c.source_record_id,
-    coalesce(ec.confidence, case when gs.source_system_count > 1 then 1.00 else 0.50 end) as match_confidence_score,
+    -- A record with no edge at all touching it (ec.confidence null) is either
+    -- a defensive fallback for a multi-source group that somehow has no
+    -- recorded edge (shouldn't normally happen -- tier1_fallback), or a truly
+    -- isolated single-source record (baseline_fallback, the "provisional" score).
+    coalesce(
+        ec.confidence,
+        case when gs.source_system_count > 1
+             then (select confidence from tier1_fallback)
+             else (select confidence from baseline_fallback)
+        end
+    ) as match_confidence_score,
     row_number() over (
         partition by c.match_group_id
         order by c.source_modified_date desc nulls last,
