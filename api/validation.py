@@ -18,9 +18,12 @@ Design notes:
     last_name, email, phone, state_code, country_code), so a single set of
     checks covers both source systems -- mirroring how silver_all_staged.sql
     computes is_invalid after staging, regardless of source.
-  - State/country reference lists are read from the same dbt seed tables the
-    batch pipeline validates against (main_rules.ref_state_codes /
-    ref_country_codes), not hardcoded here, so the two paths can't drift.
+  - State/country reference lists are read from the same DB-native reference
+    tables the batch pipeline validates against (ref.ref_state_codes /
+    ref.ref_country_codes, maintained via the Reference Data Maintenance
+    screen's maker-checker workflow), not hardcoded here, so the two paths
+    can't drift. Queried fresh on every call (no caching) since these tables
+    can change at runtime, unlike the old static seed CSVs.
   - The reject reason strings intentionally match the wording already shown in
     the stewardship UI's "FAILED VALIDATION" box (silver_all_staged.sql), so a
     "still failing" alert reads consistently with what the steward saw when
@@ -32,24 +35,15 @@ from db import run_query
 
 _EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
-_state_codes_cache = None
-_country_codes_cache = None
-
 
 def _valid_state_codes():
-    global _state_codes_cache
-    if _state_codes_cache is None:
-        df = run_query("SELECT state_code FROM main_rules.ref_state_codes")
-        _state_codes_cache = set(df["state_code"].tolist())
-    return _state_codes_cache
+    df = run_query("SELECT state_code FROM ref.ref_state_codes WHERE is_active")
+    return set(df["state_code"].tolist())
 
 
 def _valid_country_codes():
-    global _country_codes_cache
-    if _country_codes_cache is None:
-        df = run_query("SELECT country_code FROM main_rules.ref_country_codes")
-        _country_codes_cache = set(df["country_code"].tolist())
-    return _country_codes_cache
+    df = run_query("SELECT country_code FROM ref.ref_country_codes WHERE is_active")
+    return set(df["country_code"].tolist())
 
 
 def validate_record(record: dict) -> list[str]:

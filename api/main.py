@@ -831,6 +831,241 @@ def reset_password(user_id: str, admin: dict = Depends(auth_mod.require_admin)):
 
 
 # ---------------------------------------------------------------------------
+# Data Governance > Reference Data Maintenance: country codes and state
+# codes. Read (GET) is open to any authenticated user; write (POST) is gated
+# to dataSteward/dataOwner (auth_mod.require_steward_or_owner) and every
+# change -- create, update, or deactivate (is_active=false; there is no hard
+# delete, same convention as auth.users/column_rules/matching_rules) -- is
+# submitted into the 'reference_data_change' maker-checker workflow (1 Data
+# Owner, different from whoever requested it) instead of applied directly.
+# ---------------------------------------------------------------------------
+
+REFERENCE_ENTITY_CONFIG = {
+    "ref_country_code": {"table": "ref.ref_country_codes", "pk": "country_code", "name_field": "country_name"},
+    "ref_state_code": {"table": "ref.ref_state_codes", "pk": "state_code", "name_field": "state_name"},
+}
+
+
+class ReferenceDataRequest(BaseModel):
+    entity_type: str          # 'ref_country_code' | 'ref_state_code'
+    code: str                 # country_code or state_code value
+    name: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+@app.get("/api/v1/reference-data/{entity_type}")
+def list_reference_data(entity_type: str, user: dict = Depends(auth_mod.get_current_user)):
+    cfg = REFERENCE_ENTITY_CONFIG.get(entity_type)
+    if cfg is None:
+        raise HTTPException(404, f"Unknown reference data entity_type '{entity_type}'")
+    df = run_query(f"SELECT * FROM {cfg['table']} ORDER BY {cfg['pk']}")
+    return {"entity_type": entity_type, "items": to_records(df)}
+
+
+@app.post("/api/v1/reference-data")
+def submit_reference_data_change(body: ReferenceDataRequest, user: dict = Depends(auth_mod.require_steward_or_owner)):
+    """Submits a create/update/deactivate of a country or state code row into
+    the 'reference_data_change' maker-checker workflow instead of writing it
+    directly -- see _execute_reference_data_change below."""
+    cfg = REFERENCE_ENTITY_CONFIG.get(body.entity_type)
+    if cfg is None:
+        raise HTTPException(404, f"Unknown reference data entity_type '{body.entity_type}'")
+    if not body.code or not body.code.strip():
+        raise HTTPException(400, "code is required")
+    code = body.code.strip().upper()
+
+    existing = run_query(f"SELECT * FROM {cfg['table']} WHERE {cfg['pk']} = ?", [code])
+    action_type = "update" if not existing.empty else "create"
+    if action_type == "create" and not body.name:
+        raise HTTPException(400, f"{cfg['name_field']} is required when creating a new code")
+
+    payload = {"entity_type": body.entity_type, "code": code, "name": body.name, "is_active": body.is_active}
+    try:
+        instance = wf_mod.start_workflow(
+            "reference_data_change", entity_type=body.entity_type, entity_id=code, maker=user,
+            action_type=action_type, payload=payload,
+        )
+    except wf_mod.WorkflowError as e:
+        raise _wf_error(e)
+
+    return {
+        "entity_type": body.entity_type, "code": code,
+        "status": "pending_approval",
+        "workflow_instance_id": instance["instance_id"],
+        "steps": instance["steps"],
+    }
+
+
+def _execute_reference_data_change(instance: dict, actor: dict) -> dict:
+    """on_approved callback for 'reference_data_change'."""
+    p = instance["payload"]
+    cfg = REFERENCE_ENTITY_CONFIG.get(p["entity_type"])
+    if cfg is None:
+        return {"error": f"Unknown entity_type '{p['entity_type']}'"}
+    code = p["code"]
+    name_col = cfg["name_field"]
+
+    if instance["action_type"] == "create":
+        existing = run_query(f"SELECT {cfg['pk']} FROM {cfg['table']} WHERE {cfg['pk']} = ?", [code])
+        if not existing.empty:
+            return {"error": f"{code} already exists -- nothing to create"}
+        run_write(
+            f"INSERT INTO {cfg['table']} ({cfg['pk']}, {name_col}, is_active, updated_by) VALUES (?, ?, ?, ?)",
+            [code, p.get("name"), p.get("is_active") if p.get("is_active") is not None else True, actor.get("user_id")],
+        )
+        action = "created"
+    else:
+        existing = run_query(f"SELECT {cfg['pk']} FROM {cfg['table']} WHERE {cfg['pk']} = ?", [code])
+        if existing.empty:
+            return {"error": f"{code} no longer exists -- nothing to update"}
+        set_parts, params = [], []
+        if p.get("name") is not None:
+            set_parts.append(f"{name_col} = ?")
+            params.append(p["name"])
+        if p.get("is_active") is not None:
+            set_parts.append("is_active = ?")
+            params.append(p["is_active"])
+        if not set_parts:
+            return {"action": "no_changes", "code": code}
+        set_parts.append("updated_ts = current_timestamp")
+        set_parts.append("updated_by = ?")
+        params.append(actor.get("user_id"))
+        params.append(code)
+        run_write(f"UPDATE {cfg['table']} SET {', '.join(set_parts)} WHERE {cfg['pk']} = ?", params)
+        action = "updated"
+
+    updated_row = run_query(f"SELECT * FROM {cfg['table']} WHERE {cfg['pk']} = ?", [code])
+    return {"action": action, "entity_type": p["entity_type"], "row": to_records(updated_row)[0]}
+
+
+# ---------------------------------------------------------------------------
+# Data Governance > Rules Configuration: column rules, matching rules,
+# matching thresholds/tiers, and survivorship rules. Read (GET) is open to
+# any authenticated user; write (POST) is gated to dataSteward/dataOwner
+# (auth_mod.require_steward_or_owner) and every change -- create, update, or
+# deactivate -- is submitted into the 'rules_config_change' maker-checker
+# workflow (quorum of 2 Data Owners -- higher-risk than reference data since
+# it can change what the batch pipeline rejects/matches/survives) instead of
+# applied directly. One workflow_type covers all four sub-tables (they share
+# the identical approval shape); `entity_type` distinguishes which table a
+# given instance targets.
+# ---------------------------------------------------------------------------
+
+RULES_ENTITY_CONFIG = {
+    "column_rule": {
+        "table": "bus_rules.column_rules", "pk": "rule_id", "id_prefix": "CR",
+        "columns": ["source_system", "source_column", "rule_type", "rule_param", "severity", "description", "is_active"],
+    },
+    "matching_rule": {
+        "table": "bus_rules.matching_rules", "pk": "rule_id", "id_prefix": "MR",
+        "columns": ["tier_id", "rule_role", "rule_order", "source_column", "transform_function", "description", "is_active"],
+    },
+    "matching_threshold": {
+        "table": "bus_rules.matching_thresholds", "pk": "tier_id", "id_prefix": "MT",
+        "columns": ["tier_order", "tier_name", "match_method", "is_match_tier",
+                    "auto_merge_threshold", "review_lower_threshold", "description", "is_active"],
+    },
+    "survivorship_rule": {
+        "table": "bus_rules.survivorship_rules", "pk": "rule_id", "id_prefix": "SR",
+        "columns": ["target_column", "rule_type", "rule_param", "description", "is_active"],
+    },
+}
+
+
+class RulesConfigRequest(BaseModel):
+    entity_type: str                  # 'column_rule' | 'matching_rule' | 'matching_threshold' | 'survivorship_rule'
+    entity_id: Optional[str] = None   # rule_id/tier_id of the row being updated; omit/None to create a new row
+    fields: dict = {}                 # column -> new value (create: all desired columns; update: only changed ones)
+
+
+@app.get("/api/v1/rules-config/{entity_type}")
+def list_rules_config(entity_type: str, user: dict = Depends(auth_mod.get_current_user)):
+    cfg = RULES_ENTITY_CONFIG.get(entity_type)
+    if cfg is None:
+        raise HTTPException(404, f"Unknown rules config entity_type '{entity_type}'")
+    order_col = "tier_order" if entity_type == "matching_threshold" else cfg["pk"]
+    df = run_query(f"SELECT * FROM {cfg['table']} ORDER BY {order_col}")
+    return {"entity_type": entity_type, "items": to_records(df)}
+
+
+@app.post("/api/v1/rules-config")
+def submit_rules_config_change(body: RulesConfigRequest, user: dict = Depends(auth_mod.require_steward_or_owner)):
+    """Submits a create/update/deactivate of a column rule, matching rule,
+    matching threshold/tier, or survivorship rule row into the
+    'rules_config_change' maker-checker workflow instead of writing it
+    directly -- see _execute_rules_config_change below."""
+    cfg = RULES_ENTITY_CONFIG.get(body.entity_type)
+    if cfg is None:
+        raise HTTPException(404, f"Unknown rules config entity_type '{body.entity_type}'")
+
+    unknown_fields = set(body.fields.keys()) - set(cfg["columns"])
+    if unknown_fields:
+        raise HTTPException(400, f"Unknown field(s) for {body.entity_type}: {', '.join(sorted(unknown_fields))}")
+
+    if body.entity_id:
+        existing = run_query(f"SELECT {cfg['pk']} FROM {cfg['table']} WHERE {cfg['pk']} = ?", [body.entity_id])
+        if existing.empty:
+            raise HTTPException(404, f"{body.entity_type} '{body.entity_id}' not found")
+        action_type = "update"
+        workflow_entity_id = body.entity_id
+    else:
+        if not body.fields:
+            raise HTTPException(400, "fields must not be empty when creating a new row")
+        action_type = "create"
+        workflow_entity_id = f"new:{body.entity_type}:{uuid.uuid4().hex[:8]}"
+
+    payload = {"entity_type": body.entity_type, "entity_id": body.entity_id, "fields": body.fields}
+    try:
+        instance = wf_mod.start_workflow(
+            "rules_config_change", entity_type=body.entity_type, entity_id=workflow_entity_id, maker=user,
+            action_type=action_type, payload=payload,
+        )
+    except wf_mod.WorkflowError as e:
+        raise _wf_error(e)
+
+    return {
+        "entity_type": body.entity_type, "entity_id": body.entity_id,
+        "status": "pending_approval",
+        "workflow_instance_id": instance["instance_id"],
+        "steps": instance["steps"],
+    }
+
+
+def _execute_rules_config_change(instance: dict, actor: dict) -> dict:
+    """on_approved callback for 'rules_config_change'."""
+    p = instance["payload"]
+    cfg = RULES_ENTITY_CONFIG.get(p["entity_type"])
+    if cfg is None:
+        return {"error": f"Unknown entity_type '{p['entity_type']}'"}
+    fields = p.get("fields") or {}
+
+    if instance["action_type"] == "create":
+        new_id = f"{cfg['id_prefix']}{uuid.uuid4().hex[:8].upper()}"
+        cols = [cfg["pk"]] + list(fields.keys())
+        vals = [new_id] + list(fields.values())
+        placeholders = ", ".join(["?"] * len(vals))
+        run_write(f"INSERT INTO {cfg['table']} ({', '.join(cols)}) VALUES ({placeholders})", vals)
+        row = to_records(run_query(f"SELECT * FROM {cfg['table']} WHERE {cfg['pk']} = ?", [new_id]))[0]
+        return {"action": "created", "entity_type": p["entity_type"], "row": row}
+
+    entity_id = p["entity_id"]
+    existing = run_query(f"SELECT {cfg['pk']} FROM {cfg['table']} WHERE {cfg['pk']} = ?", [entity_id])
+    if existing.empty:
+        return {"error": f"{entity_id} no longer exists -- nothing to update"}
+    if not fields:
+        return {"action": "no_changes", "entity_id": entity_id}
+    set_parts = [f"{col} = ?" for col in fields]
+    params = list(fields.values())
+    set_parts.append("updated_ts = current_timestamp")
+    set_parts.append("updated_by = ?")
+    params.append(actor.get("user_id"))
+    params.append(entity_id)
+    run_write(f"UPDATE {cfg['table']} SET {', '.join(set_parts)} WHERE {cfg['pk']} = ?", params)
+    row = to_records(run_query(f"SELECT * FROM {cfg['table']} WHERE {cfg['pk']} = ?", [entity_id]))[0]
+    return {"action": "updated", "entity_type": p["entity_type"], "row": row}
+
+
+# ---------------------------------------------------------------------------
 # workflow_type -> (on_approved, on_rejected) executor registry, used by
 # decide_workflow_instance() above. Defined last because it references
 # functions declared throughout this file; only looked up at call time.
@@ -840,6 +1075,8 @@ _WORKFLOW_EXECUTORS = {
     "gold_record_edit": (_execute_gold_edit, None),
     "match_review_confirmation": (_execute_match_review, _rollback_match_review_submission),
     "user_admin_change": (_dispatch_user_admin_change, None),
+    "reference_data_change": (_execute_reference_data_change, None),
+    "rules_config_change": (_execute_rules_config_change, None),
 }
 
 

@@ -1,6 +1,8 @@
 """
 Runs the full pipeline build in order, cross-platform (Windows/macOS/Linux):
 
+  0. python scripts/ensure_governed_schemas.py  (provisions ref.*/bus_rules.* --
+                                                   see below for why this runs first)
   1. dbt seed
   2. dbt run --exclude gold.*          (bronze is already loaded separately, see below)
   3. python scripts/generate_matches.py  (embedding-based match/merge -- needs silver)
@@ -12,6 +14,17 @@ This exists because the gold layer now depends on a Python step (embedding
 similarity via scikit-learn) that has to run strictly between silver and gold
 -- a single `dbt run` can no longer build the whole pipeline in one command.
 See scripts/generate_matches.py's docstring for why.
+
+Step 0 exists because Reference Data Maintenance and Rules Configuration
+(Data Governance nav) moved country/state codes and column/matching/
+survivorship rules out of dbt seeds into DB-native tables (schemas 'ref' and
+'bus_rules', maintained via those screens' maker-checker workflows). Step 2's
+silver models now read ref.ref_state_codes/ref_country_codes as a
+{{ source(...) }}, and step 4's gold_crosswalk.sql reads
+bus_rules.matching_thresholds the same way -- both schemas must already exist
+and be populated before dbt runs, which can be before the FastAPI app has
+ever started (e.g. a fresh clone). See scripts/ensure_governed_schemas.py's
+docstring for the full rationale.
 
 Step 5 must run immediately after step 4, before any other write touches
 main_gold.gold_customers -- it diffs the freshly rebuilt table against the
@@ -53,6 +66,7 @@ def main():
     # from a previous run/OS/path can go stale and dbt raises a KeyError
     # looking up a macro file (e.g. 'mdm_demo://macros\\proper_case.sql')
     # that doesn't match the current parse. Cheap insurance, no downside.
+    run([sys.executable, str(PROJECT_ROOT / "scripts" / "ensure_governed_schemas.py")])
     run(["dbt", "--no-partial-parse", "seed"], cwd=DBT_PROJECT_DIR, env=env)
     run(["dbt", "--no-partial-parse", "run", "--exclude", "gold.*"], cwd=DBT_PROJECT_DIR, env=env)
     run([sys.executable, str(PROJECT_ROOT / "scripts" / "generate_matches.py")])

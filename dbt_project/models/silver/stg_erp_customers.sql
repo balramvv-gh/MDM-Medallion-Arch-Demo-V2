@@ -40,7 +40,7 @@ select
     -- R011: phone required
     (phone is null) as err_missing_phone,
     -- R012: state reference check
-    (state_code is null or state_code not in (select state_code from {{ ref('ref_state_codes') }})) as err_invalid_state,
+    (state_code is null or state_code not in (select state_code from {{ source('ref', 'ref_state_codes') }} where is_active)) as err_invalid_state,
     -- R013: country reference check
-    (country_code is null or country_code not in (select country_code from {{ ref('ref_country_codes') }})) as err_invalid_country
+    (country_code is null or country_code not in (select country_code from {{ source('ref', 'ref_country_codes') }} where is_active)) as err_invalid_country
 from standardized

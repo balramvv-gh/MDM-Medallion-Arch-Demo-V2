@@ -1,0 +1,36 @@
+version: 2
+
+sources:
+  - name: ref
+    schema: ref
+    description: >
+      Reference Data Maintenance (Data Governance nav). Country codes and
+      state codes, DB-native tables maintained at runtime via the FastAPI
+      CRUD layer and gated by the 'reference_data_change' maker-checker
+      workflow (api/db.py's _ensure_reference_tables) -- not a dbt seed.
+      Same "Python/API writes it, dbt reads it as a source" pattern used for
+      gold_prep.
+    tables:
+      - name: ref_country_codes
+        description: ISO-style two-letter country codes with a human-readable country_name and is_active flag.
+      - name: ref_state_codes
+        description: Two-letter US state codes (50 states + DC) with a human-readable state_name and is_active flag.
+
+  - name: bus_rules
+    schema: bus_rules
+    description: >
+      Rules Configuration (Data Governance nav). Column validation rules,
+      matching rules, matching thresholds/tiers, and survivorship rules --
+      DB-native tables maintained at runtime via the FastAPI CRUD layer and
+      gated by the 'rules_config_change' maker-checker workflow (api/db.py's
+      _ensure_bus_rules_tables) -- not a dbt seed. Same "Python/API writes it,
+      dbt reads it as a source" pattern used for gold_prep.
+    tables:
+      - name: column_rules
+        description: Field-level validation/standardization rules applied in stg_crm_customers.sql/stg_erp_customers.sql (informational reference here; the actual logic is hardcoded per-column in those models and mirrored in api/validation.py).
+      - name: matching_rules
+        description: Per-tier field roles (exact_match_field, similarity_text_field, blocking_key) consumed by scripts/generate_matches.py and api/reprocessing.py.
+      - name: matching_thresholds
+        description: Tier definitions (order, method, auto-merge/review thresholds) consumed by scripts/generate_matches.py, api/reprocessing.py, and gold_crosswalk.sql.
+      - name: survivorship_rules
+        description: One active rule per gold_customers target_column, driving attribute-level survivorship in gold_customers.sql/gold_crosswalk.sql.

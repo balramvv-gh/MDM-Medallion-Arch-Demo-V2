@@ -19,6 +19,8 @@ def get_con():
         _ensure_auth_tables(_con)
         _ensure_audit_tables(_con)
         _ensure_governance_tables(_con)
+        _ensure_reference_tables(_con)
+        _ensure_bus_rules_tables(_con)
     return _con
 
 
@@ -222,18 +224,27 @@ def _ensure_governance_tables(con):
         );
     """)
 
-    existing = con.execute("SELECT COUNT(*) FROM governance.workflow_definitions").fetchone()[0]
-    if existing == 0:
-        for row in DEFAULT_WORKFLOW_DEFINITIONS:
-            con.execute("""
-                INSERT INTO governance.workflow_definitions
-                    (workflow_type, step_order, step_name, required_role, approvals_required, is_active)
-                VALUES (?, ?, ?, ?, ?, true)
-            """, row)
+    # Per-workflow_type existence check (not a whole-table-empty check) so that
+    # adding a new workflow_type to DEFAULT_WORKFLOW_DEFINITIONS later -- as
+    # happened when reference_data_change/rules_config_change were added --
+    # gets backfilled into an already-running DB on next app start, without
+    # re-inserting or duplicating rows for workflow_types seeded earlier.
+    existing_types = set(
+        con.execute("SELECT DISTINCT workflow_type FROM governance.workflow_definitions").fetchdf()["workflow_type"]
+    )
+    for row in DEFAULT_WORKFLOW_DEFINITIONS:
+        if row[0] in existing_types:
+            continue
+        con.execute("""
+            INSERT INTO governance.workflow_definitions
+                (workflow_type, step_order, step_name, required_role, approvals_required, is_active)
+            VALUES (?, ?, ?, ?, ?, true)
+        """, row)
 
 
-# Seeded once, on first boot with an empty workflow_definitions table. See
-# _ensure_governance_tables' docstring for why this isn't a dbt seed CSV.
+# Seeded once per workflow_type, the first time that workflow_type is seen with
+# an empty set of definitions. See _ensure_governance_tables' docstring for why
+# this isn't a dbt seed CSV.
 DEFAULT_WORKFLOW_DEFINITIONS = [
     # Data Stewardship: exception-queue resolve/reject. 1 level, 1 Data Owner.
     ("stewardship_remediation", 1, "Data Owner review", "dataOwner", 1),
@@ -249,6 +260,271 @@ DEFAULT_WORKFLOW_DEFINITIONS = [
     # User Administration: create user, or update role/gold_access/is_active.
     # 1 level, 1 Admin (must be a different admin than whoever made the request).
     ("user_admin_change", 1, "Admin sign-off", "admin", 1),
+
+    # Data Governance > Reference Data Maintenance: create/update/deactivate a
+    # country or state code row. 1 level, 1 Data Owner. (Submission itself is
+    # gated to dataSteward/dataOwner via auth.require_steward_or_owner; this
+    # defines who approves it, which is dataOwner-only, same convention as
+    # stewardship_remediation.)
+    ("reference_data_change", 1, "Data Owner review", "dataOwner", 1),
+
+    # Data Governance > Rules Configuration: create/update/deactivate a column
+    # rule, matching rule, matching threshold/tier, or survivorship rule row.
+    # 1 level, quorum of 2 Data Owners (higher-risk than reference data since
+    # it can change what the batch pipeline rejects/matches/survives).
+    ("rules_config_change", 1, "Data Owner quorum (2 of 2)", "dataOwner", 2),
+]
+
+
+def _ensure_reference_tables(con):
+    """Reference Data Maintenance (Data Governance nav): country codes and
+    state codes, DB-native and editable at runtime via the maker-checker
+    'reference_data_change' workflow, instead of the old
+    dbt_project/seeds/ref_country_codes.csv / ref_state_codes.csv. dbt models
+    (stg_crm_customers.sql, stg_erp_customers.sql) now read these two tables
+    as a source (schema 'ref') rather than via {{ ref(...) }} against a seed --
+    same "Python/API writes it, dbt reads it as a source" pattern already used
+    for gold_prep and governance.
+
+    Both tables carry a human-readable *_name label (added per governance
+    request) alongside the code, and an is_active flag for the "deactivate,
+    never hard-delete" convention used everywhere else in this app (auth.users,
+    column_rules, matching_rules). Only active rows should be treated as valid
+    codes by validation.py and the dbt staging models."""
+    con.execute("CREATE SCHEMA IF NOT EXISTS ref;")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS ref.ref_country_codes (
+            country_code VARCHAR PRIMARY KEY,
+            country_name VARCHAR,
+            is_active BOOLEAN DEFAULT true,
+            created_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_by VARCHAR
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS ref.ref_state_codes (
+            state_code VARCHAR PRIMARY KEY,
+            state_name VARCHAR,
+            is_active BOOLEAN DEFAULT true,
+            created_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_by VARCHAR
+        );
+    """)
+
+    if con.execute("SELECT COUNT(*) FROM ref.ref_country_codes").fetchone()[0] == 0:
+        for row in DEFAULT_COUNTRY_CODES:
+            con.execute("INSERT INTO ref.ref_country_codes (country_code, country_name) VALUES (?, ?)", row)
+
+    if con.execute("SELECT COUNT(*) FROM ref.ref_state_codes").fetchone()[0] == 0:
+        for row in DEFAULT_STATE_CODES:
+            con.execute("INSERT INTO ref.ref_state_codes (state_code, state_name) VALUES (?, ?)", row)
+
+
+# Migrated from dbt_project/seeds/ref_country_codes.csv, with country_name
+# added per the Reference Data Maintenance requirements.
+DEFAULT_COUNTRY_CODES = [
+    ("US", "United States"), ("CA", "Canada"), ("MX", "Mexico"), ("GB", "United Kingdom"),
+    ("DE", "Germany"), ("FR", "France"), ("IN", "India"), ("CN", "China"),
+    ("JP", "Japan"), ("AU", "Australia"),
+]
+
+# Migrated from dbt_project/seeds/ref_state_codes.csv (50 states + DC), with
+# state_name added per the Reference Data Maintenance requirements.
+DEFAULT_STATE_CODES = [
+    ("AL", "Alabama"), ("AK", "Alaska"), ("AZ", "Arizona"), ("AR", "Arkansas"),
+    ("CA", "California"), ("CO", "Colorado"), ("CT", "Connecticut"), ("DE", "Delaware"),
+    ("FL", "Florida"), ("GA", "Georgia"), ("HI", "Hawaii"), ("ID", "Idaho"),
+    ("IL", "Illinois"), ("IN", "Indiana"), ("IA", "Iowa"), ("KS", "Kansas"),
+    ("KY", "Kentucky"), ("LA", "Louisiana"), ("ME", "Maine"), ("MD", "Maryland"),
+    ("MA", "Massachusetts"), ("MI", "Michigan"), ("MN", "Minnesota"), ("MS", "Mississippi"),
+    ("MO", "Missouri"), ("MT", "Montana"), ("NE", "Nebraska"), ("NV", "Nevada"),
+    ("NH", "New Hampshire"), ("NJ", "New Jersey"), ("NM", "New Mexico"), ("NY", "New York"),
+    ("NC", "North Carolina"), ("ND", "North Dakota"), ("OH", "Ohio"), ("OK", "Oklahoma"),
+    ("OR", "Oregon"), ("PA", "Pennsylvania"), ("RI", "Rhode Island"), ("SC", "South Carolina"),
+    ("SD", "South Dakota"), ("TN", "Tennessee"), ("TX", "Texas"), ("UT", "Utah"),
+    ("VT", "Vermont"), ("VA", "Virginia"), ("WA", "Washington"), ("WV", "West Virginia"),
+    ("WI", "Wisconsin"), ("WY", "Wyoming"), ("DC", "District of Columbia"),
+]
+
+
+def _ensure_bus_rules_tables(con):
+    """Rules Configuration (Data Governance nav): column rules, matching
+    rules, matching thresholds/tiers, and survivorship rules -- all DB-native
+    and editable at runtime via the maker-checker 'rules_config_change'
+    workflow, instead of the old dbt_project/seeds/column_rules.csv,
+    matching_rules.csv, matching_thresholds.csv. dbt (gold_crosswalk.sql) and
+    the batch/real-time matching code (scripts/generate_matches.py,
+    api/reprocessing.py) now read matching_thresholds/matching_rules as a
+    source (schema 'bus_rules') instead of a seed. column_rules currently has
+    no live SQL reader anywhere (see api/validation.py, which hardcodes the
+    same rule logic in Python) -- it's still moved here so it can be
+    maintained through the same CRUD/approval screen as the others.
+
+    survivorship_rules is new: exactly one active rule per gold_customers
+    target_column, choosing how that column's value is picked across
+    contributing source records. rule_type is one of 'most_common' (the value
+    that appears in the most contributing records), 'most_complete' (prefers
+    non-null/non-blank over blank), 'oldest' / 'newest' (by that source
+    record's source_modified_date), or 'pattern_match' (prefers a value
+    matching rule_param, a regex). Ties within a rule_type's own logic always
+    fall back to 'newest' (by source_modified_date) as the universal
+    tie-breaker -- that fallback is hardcoded in the evaluation engine
+    (dbt_project/models/gold/gold_customers.sql), not itself a configurable
+    rule, per the governance decision that there is exactly one primary rule
+    per column plus one fixed tie-break, not an arbitrary stack."""
+    con.execute("CREATE SCHEMA IF NOT EXISTS bus_rules;")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS bus_rules.column_rules (
+            rule_id VARCHAR PRIMARY KEY,
+            source_system VARCHAR,
+            source_column VARCHAR,
+            rule_type VARCHAR,        -- not_null | regex | reference_state | reference_country | trim_case_proper | standardize_phone_us | lowercase
+            rule_param VARCHAR,
+            severity VARCHAR,         -- reject | correct
+            active BOOLEAN DEFAULT true,
+            description VARCHAR,
+            created_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_by VARCHAR
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS bus_rules.matching_rules (
+            rule_id VARCHAR PRIMARY KEY,
+            tier_id VARCHAR,
+            rule_role VARCHAR,        -- exact_match_field | similarity_text_field | blocking_key
+            rule_order INTEGER,
+            source_column VARCHAR,
+            transform_function VARCHAR,
+            active BOOLEAN DEFAULT true,
+            description VARCHAR,
+            created_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_by VARCHAR
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS bus_rules.matching_thresholds (
+            tier_id VARCHAR PRIMARY KEY,
+            tier_order INTEGER,
+            tier_name VARCHAR,
+            match_method VARCHAR,
+            is_match_tier BOOLEAN,
+            auto_merge_threshold DOUBLE,
+            review_lower_threshold DOUBLE,
+            active BOOLEAN DEFAULT true,
+            description VARCHAR,
+            created_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_by VARCHAR
+        );
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS bus_rules.survivorship_rules (
+            rule_id VARCHAR PRIMARY KEY,
+            target_column VARCHAR UNIQUE,  -- gold_customers column this rule governs
+            rule_type VARCHAR,             -- most_common | most_complete | oldest | newest | pattern_match
+            rule_param VARCHAR,            -- pattern_match only: a regex to prefer
+            active BOOLEAN DEFAULT true,
+            description VARCHAR,
+            created_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_ts TIMESTAMP DEFAULT current_timestamp,
+            updated_by VARCHAR
+        );
+    """)
+
+    if con.execute("SELECT COUNT(*) FROM bus_rules.column_rules").fetchone()[0] == 0:
+        for row in DEFAULT_COLUMN_RULES:
+            con.execute("""
+                INSERT INTO bus_rules.column_rules
+                    (rule_id, source_system, source_column, rule_type, rule_param, severity, description)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, row)
+
+    if con.execute("SELECT COUNT(*) FROM bus_rules.matching_rules").fetchone()[0] == 0:
+        for row in DEFAULT_MATCHING_RULES:
+            con.execute("""
+                INSERT INTO bus_rules.matching_rules
+                    (rule_id, tier_id, rule_role, rule_order, source_column, transform_function, description)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, row)
+
+    if con.execute("SELECT COUNT(*) FROM bus_rules.matching_thresholds").fetchone()[0] == 0:
+        for row in DEFAULT_MATCHING_THRESHOLDS:
+            con.execute("""
+                INSERT INTO bus_rules.matching_thresholds
+                    (tier_id, tier_order, tier_name, match_method, is_match_tier,
+                     auto_merge_threshold, review_lower_threshold, description)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, row)
+
+    if con.execute("SELECT COUNT(*) FROM bus_rules.survivorship_rules").fetchone()[0] == 0:
+        for row in DEFAULT_SURVIVORSHIP_RULES:
+            con.execute("""
+                INSERT INTO bus_rules.survivorship_rules (rule_id, target_column, rule_type, rule_param, description)
+                VALUES (?, ?, ?, ?, ?)
+            """, row)
+
+
+# Migrated verbatim from dbt_project/seeds/column_rules.csv.
+DEFAULT_COLUMN_RULES = [
+    ("R001", "CRM", "first_name", "not_null", None, "reject", "First name is required"),
+    ("R002", "CRM", "last_name", "not_null", None, "reject", "Last name is required"),
+    ("R003", "CRM", "email", "regex", r"^[^@\s]+@[^@\s]+\.[^@\s]+$", "reject", "Email must match standard format"),
+    ("R004", "CRM", "state", "reference_state", None, "reject", "State must be a valid two-letter US state code"),
+    ("R005", "CRM", "country", "reference_country", None, "reject", "Country must be a valid ISO country code"),
+    ("R006", "CRM", "first_name", "trim_case_proper", None, "correct", "Trim whitespace and apply proper case"),
+    ("R007", "CRM", "last_name", "trim_case_proper", None, "correct", "Trim whitespace and apply proper case"),
+    ("R008", "CRM", "phone", "standardize_phone_us", None, "correct", "Standardize to E.164-style +1 format"),
+    ("R009", "ERP", "full_name", "not_null", None, "reject", "Full name is required"),
+    ("R010", "ERP", "email_addr", "regex", r"^[^@\s]+@[^@\s]+\.[^@\s]+$", "reject", "Email must match standard format"),
+    ("R011", "ERP", "contact_phone", "not_null", None, "reject", "Phone is required"),
+    ("R012", "ERP", "state_code", "reference_state", None, "reject", "State must be a valid two-letter US state code"),
+    ("R013", "ERP", "country_code", "reference_country", None, "reject", "Country must be a valid ISO country code"),
+    ("R014", "ERP", "email_addr", "lowercase", None, "correct", "Normalize email to lowercase"),
+    ("R015", "ERP", "contact_phone", "standardize_phone_us", None, "correct", "Standardize to E.164-style +1 format"),
+]
+
+# Migrated verbatim from dbt_project/seeds/matching_rules.csv.
+DEFAULT_MATCHING_RULES = [
+    ("MR001", "MT001", "exact_match_field", 1, "email", "normalize_email", "Normalized (trimmed, lowercased) email must match exactly"),
+    ("MR002", "MT001", "exact_match_field", 2, "phone", "normalize_phone", "Normalized (digits-only) phone must match exactly"),
+    ("MR003", "MT002", "similarity_text_field", 1, "first_name", "none", "Included in the concatenated text used for TF-IDF similarity scoring"),
+    ("MR004", "MT002", "similarity_text_field", 2, "last_name", "none", "Included in the concatenated text used for TF-IDF similarity scoring"),
+    ("MR005", "MT002", "similarity_text_field", 3, "address_line1", "none", "Included in the concatenated text used for TF-IDF similarity scoring"),
+    ("MR006", "MT002", "similarity_text_field", 4, "address_line2", "none", "Included in the concatenated text used for TF-IDF similarity scoring (optional field, blank treated as empty string)"),
+    ("MR007", "MT002", "similarity_text_field", 5, "city", "none", "Included in the concatenated text used for TF-IDF similarity scoring"),
+    ("MR008", "MT002", "blocking_key", 1, "state_code", "none", "Candidate pairs are only compared within the same blocking key value, to avoid O(n^2) comparisons at scale. Deliberately excludes email/phone from tier 2 entirely -- those are exactly the fields tier 2 exists to catch disagreement on."),
+]
+
+# Migrated verbatim from dbt_project/seeds/matching_thresholds.csv.
+DEFAULT_MATCHING_THRESHOLDS = [
+    ("MT000", 0, "No-Match Baseline", "no_match_baseline", False, 0.50, None,
+     "Not a real matching tier -- confidence assigned to a single-source golden record with no corroborating match from any tier (\"provisional\")"),
+    ("MT001", 1, "Tier 1: Exact Match", "exact", True, 1.00, None,
+     "Two records are the same customer if they share an exact match on any active exact_match_field rule (see matching_rules) after that field's transform_function is applied. Binary -- no review band; confidence is always this tier's auto_merge_threshold."),
+    ("MT002", 2, "Tier 2: Fuzzy Similarity Match", "fuzzy_tfidf_cosine", True, 0.80, 0.35,
+     "Candidate pairs within the same blocking_key value (see matching_rules rule_role=blocking_key) are scored by TF-IDF character n-gram cosine similarity over the concatenated similarity_text_field columns. score >= auto_merge_threshold auto-merges; review_lower_threshold <= score < auto_merge_threshold is queued to the Match Review queue for steward confirm/reject; score < review_lower_threshold is not a candidate at all."),
+]
+
+# New: one starter rule per gold_customers editable column. Defaulting every
+# column to 'newest' reproduces today's existing record-level "most recently
+# modified source wins" behavior exactly, so turning on attribute-level
+# survivorship is a no-op for pipeline output until a governance user tunes
+# individual columns to a different rule_type.
+DEFAULT_SURVIVORSHIP_RULES = [
+    ("SR001", "first_name", "newest", None, "Most recently modified source wins"),
+    ("SR002", "last_name", "newest", None, "Most recently modified source wins"),
+    ("SR003", "email", "newest", None, "Most recently modified source wins"),
+    ("SR004", "phone", "newest", None, "Most recently modified source wins"),
+    ("SR005", "address_line1", "newest", None, "Most recently modified source wins"),
+    ("SR006", "address_line2", "newest", None, "Most recently modified source wins"),
+    ("SR007", "city", "newest", None, "Most recently modified source wins"),
+    ("SR008", "state_code", "newest", None, "Most recently modified source wins"),
+    ("SR009", "postal_code", "newest", None, "Most recently modified source wins"),
+    ("SR010", "country_code", "newest", None, "Most recently modified source wins"),
 ]
 
 

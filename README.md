@@ -9,23 +9,28 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
 - **Bronze layer** — raw customer extracts from two heterogeneous source systems (a
   CRM and an ERP), landed untouched.
 - **Silver layer** — cleansing, standardization, and validation driven entirely by
-  **metadata** (`dbt_project/seeds/column_rules.csv`), not hardcoded logic. Records
+  **metadata** (`bus_rules.column_rules`, a DB-native table maintained via the Data
+  Governance > Rules Configuration screen), not hardcoded logic. Records
   that fail validation are routed to an exception queue instead of the pipeline.
 - **Gold layer (Data Hub)** — hybrid match/merge across source systems, **entirely
-  metadata-driven**: tiers and thresholds live in `dbt_project/seeds/matching_thresholds.csv`,
-  and the columns each tier compares live in `dbt_project/seeds/matching_rules.csv` — the
-  same "rules live in a seed, not in code" pattern as `column_rules.csv`. Today's seed
-  configures deterministic exact matching on normalized email/phone, plus an
+  metadata-driven**: tiers and thresholds live in `bus_rules.matching_thresholds`,
+  and the columns each tier compares live in `bus_rules.matching_rules` — the
+  same "rules live as governed metadata, not in code" pattern as `bus_rules.column_rules`.
+  Today's configuration has deterministic exact matching on normalized email/phone, plus an
   **embedding-similarity (fuzzy) tier** that catches near-duplicates exact
   matching misses (typos, nicknames, reformatted addresses) via TF-IDF
   character n-gram cosine similarity, computed in `scripts/generate_matches.py`
   and clustered with union-find. High-confidence fuzzy matches auto-merge;
   borderline ones go to a **Match Review queue** for a data steward to confirm
-  or reject. Record-level survivorship and a **crosswalk table** preserve the
-  link between every golden record and its contributing source records, with
+  or reject. **Survivorship is attribute-level**: each gold column is independently won
+  by whichever contributing source best satisfies that column's own rule in
+  `bus_rules.survivorship_rules` (most common / most complete / oldest / newest / pattern
+  match), tie-broken by most-recently-modified (then CRM preferred). A **crosswalk table**
+  preserves the link between every golden record and its contributing source records —
+  including, per source, exactly which gold columns it won — with
   a graduated match confidence score (that tier's `auto_merge_threshold` for exact,
-  the actual similarity score for fuzzy, and a seeded 0.50 "provisional" baseline
-  for uncorroborated single-source records) — all sourced from the seed, not
+  the actual similarity score for fuzzy, and a 0.50 "provisional" baseline
+  for uncorroborated single-source records) — all sourced from governed metadata, not
   hardcoded literals.
 - **Data Stewardship app** (`/app/`) — restricted to `dataSteward` / `dataOwner`
   accounts, two tabs: an **Exception Queue** console for reviewing rejected records,
@@ -61,9 +66,10 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
   timeline where each edit is one entry with expandable old→new field-level diffs.
   Viewable by any user with gold `read` or `read_write` access — same gating as viewing
   the record itself. There is no update/delete endpoint for it, by design.
-- **Data Governance** (`/portal/`, a nav dropdown) — two items, each independently
-  visible based on the signed-in user's role/access, so the dropdown itself is hidden
-  if neither would show:
+- **Data Governance** (`/portal/`, a nav dropdown) — four items. Data Stewardship and
+  Lineage and Impact Analysis are each independently role-gated; Reference Data
+  Maintenance and Rules Configuration are visible to everyone (read-only outside
+  dataSteward/dataOwner), so the dropdown itself is always shown:
   - **Data Stewardship** — visible only to `dataSteward`/`dataOwner` accounts (the
     same role gate as the Stewardship console itself). Opens `/app/` in a browser tab
     named `mdmStewardshipTab`; clicking it again while that tab is still open
@@ -81,18 +87,30 @@ application, a login-gated data hub portal, and a REST API over the gold layer.
     rules, and upstream/downstream node counts — in a side panel. Clicking a
     gold-layer node also offers a quick lookup of any specific Golden ID's
     contributing source records.
+  - **Reference Data Maintenance** — Country Codes and State Codes, each with a
+    human-readable name/label and an active/deactivated status, in DB-native tables
+    (`ref.ref_country_codes`/`ref.ref_state_codes`) the silver staging models read
+    directly. Anyone can view the list; create/edit/deactivate is limited to
+    `dataSteward`/`dataOwner` and goes through maker-checker (1 Data Owner approver).
+  - **Rules Configuration** — Column Rules, Matching Rules (with their tier
+    definitions), and **Survivorship Rules** (new — see below), all in DB-native
+    tables (`bus_rules.*`) the batch pipeline and real-time reprocessing both read.
+    Same read-everyone/write-steward-or-owner split as Reference Data Maintenance, but
+    changes go through a stricter maker-checker gate (quorum of 2 different Data
+    Owners) since these rules govern what the pipeline rejects, matches, and survives.
 - **Maker-Checker Approval Workflow Engine** — several state-changing actions across
   both apps now submit into a generic, metadata-driven approval workflow
   (`api/workflow_engine.py`, `governance.workflow_definitions`) instead of applying
   immediately: stewardship remediation (resolve/reject an exception — 1 Data Owner),
   a Portal gold-record edit (a quorum of 2 different Data Owners), a Match Review
-  confirm/reject (Data Owner, then Admin), and a User Administration create or
-  role/gold_access/is_active change (1 Admin, different from whoever requested it). A
-  maker can never approve their own submission, and the same approver can never
-  decide twice on one instance. Both apps expose an **Approvals** view (backed by
-  `GET /api/v1/workflows/pending`, `GET /api/v1/workflows/mine`, and
-  `POST /api/v1/workflows/{instance_id}/decide`) for seeing what's awaiting a
-  decision and what you've submitted.
+  confirm/reject (Data Owner, then Admin), a User Administration create or
+  role/gold_access/is_active change (1 Admin, different from whoever requested it),
+  a Reference Data Maintenance change (1 Data Owner), and a Rules Configuration change
+  (a quorum of 2 different Data Owners). A maker can never approve their own
+  submission, and the same approver can never decide twice on one instance. Both apps
+  expose an **Approvals** view (backed by `GET /api/v1/workflows/pending`,
+  `GET /api/v1/workflows/mine`, and `POST /api/v1/workflows/{instance_id}/decide`) for
+  seeing what's awaiting a decision and what you've submitted.
 - **REST API** — exposes the gold layer (and its crosswalk) for downstream system
   consumption.
 
@@ -283,22 +301,27 @@ Enable AI remediation with `export ANTHROPIC_API_KEY=your_key_here` before start
 | `GET /api/v1/workflows/mine` | Workflow instances the caller submitted, with status |
 | `GET /api/v1/workflows/{instance_id}` | One workflow instance, full detail including decisions so far |
 | `POST /api/v1/workflows/{instance_id}/decide` | Approve or reject the current step (`{decision, comment}`) |
+| `GET /api/v1/reference-data/{entity_type}` | List country codes or state codes (`ref_country_code`/`ref_state_code`) — any authenticated user |
+| `POST /api/v1/reference-data` | Submit a create/update/deactivate for Data Owner approval (dataSteward/dataOwner only) |
+| `GET /api/v1/rules-config/{entity_type}` | List column rules, matching rules, matching thresholds/tiers, or survivorship rules — any authenticated user |
+| `POST /api/v1/rules-config` | Submit a create/update/deactivate for a 2-Data-Owner quorum (dataSteward/dataOwner only) |
 
 All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints require an
 `Authorization: Bearer <token>` header from `/api/v1/auth/login`.
 
 ## Design notes / known simplifications (by design, for demo scope)
 
-- **Matching is metadata-driven**, the same pattern as `column_rules.csv`: tier
-  definitions and thresholds live in `dbt_project/seeds/matching_thresholds.csv`,
-  and the fields each tier compares live in `dbt_project/seeds/matching_rules.csv`
-  (a child table keyed by tier_id). Nothing about *which* fields matter or *what*
+- **Matching is metadata-driven**, the same pattern as `bus_rules.column_rules`: tier
+  definitions and thresholds live in `bus_rules.matching_thresholds`,
+  and the fields each tier compares live in `bus_rules.matching_rules`
+  (a child table keyed by tier_id) — both DB-native, maintained via the Data Governance >
+  Rules Configuration screen. Nothing about *which* fields matter or *what*
   threshold counts as a match is hardcoded in `scripts/generate_matches.py` or
-  `api/reprocessing.py` — both read the seed at runtime. Today's seed configures a
+  `api/reprocessing.py` — both read the table at runtime. Today's configuration has a
   hybrid of deterministic exact matching (normalized email or phone, confidence =
   that tier's `auto_merge_threshold`) and an embedding-similarity fuzzy tier (TF-IDF
   character n-gram cosine similarity over name/address text, blocked by
-  state_code). Fuzzy matches above the seed's `auto_merge_threshold` auto-merge with
+  state_code). Fuzzy matches above the configured `auto_merge_threshold` auto-merge with
   their similarity score as confidence; matches between `review_lower_threshold` and
   `auto_merge_threshold` go to a **Match Review** queue for a steward to confirm or
   reject rather than auto-merging. This is a real embedding-similarity technique used
@@ -306,8 +329,8 @@ All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints requ
   fully offline, no GPU) rather than a neural sentence-embedding model — a
   reasonable next iteration if higher recall on more subtle near-duplicates is
   needed. See `scripts/generate_matches.py` for the full algorithm and calibration
-  notes, and `dbt_project/seeds/matching_thresholds.csv` /
-  `matching_rules.csv` for the tier/field configuration itself.
+  notes, and `bus_rules.matching_thresholds` / `bus_rules.matching_rules` for the
+  tier/field configuration itself.
   **Known gap:** the real-time reprocessing path (steward resolves a
   validation exception → immediate re-match) still only evaluates the exact
   (`match_method='exact'`) tier; the fuzzy tier only runs in the batch pipeline.
@@ -315,18 +338,23 @@ All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints requ
   request latency for a demo-scoped feature. Both paths read the same
   `exact_match_field` rules, though, so they can't disagree on which fields
   count as an exact match.
-- **Survivorship** is record-level (most-recently-modified source wins for the
-  whole record), not attribute-level — a natural next iteration.
-- Rules are documented as metadata (`column_rules.csv`) and referenced by rule ID
+- **Survivorship is attribute-level**: each gold column is picked independently by its
+  own rule in `bus_rules.survivorship_rules` (most common / most complete / oldest /
+  newest / pattern match across contributing sources), tie-broken by most recently
+  modified (then CRM preferred) — see `dbt_project/models/gold/gold_survivorship_winners.sql`
+  for the batch evaluation and `api/reprocessing.py`'s `_pick_column_winners()` for the
+  real-time equivalent. `gold_crosswalk`'s `winning_columns` shows exactly which gold
+  columns each contributing source won. Known gap: no cross-column consistency check
+  (see `PROJECT_KNOWLEDGE.md`).
+- Rules are documented as metadata (`bus_rules.column_rules`) and referenced by rule ID
   throughout the pipeline and stewardship app; the current implementation applies
   them via explicit SQL rather than fully dynamic rule interpretation, trading a
   bit of "purity" for time-boxed reliability.
 - **Auth** is a from-scratch bcrypt + bearer-token implementation sized for a demo
   (sessions expire after 8 hours, no refresh tokens, no MFA). A production system
   would typically delegate this to an identity provider (Okta, Azure AD, etc.).
-- The **maker-checker workflow engine** only gates the four workflows above —
-  Reference Data Maintenance and Rules Configuration (planned Data Governance
-  screens) aren't built yet. If the underlying action fails after every required
+- The **maker-checker workflow engine** gates six workflows (see above). If the
+  underlying action fails after every required
   approval is already recorded, the instance is still marked `approved` (the human
   decision stands) with the failure captured in its `result` field rather than
   silently rolled back — there's no automatic retry. A quorum or multi-level chain
@@ -335,17 +363,17 @@ All `/api/v1/customers*`, `/api/v1/admin/*` and `/api/v1/auth/me` endpoints requ
 - The database (`mdm_demo.duckdb`) is a single local file — fine for a demo, not a
   substitute for a real concurrent multi-user warehouse.
 - **Steward-corrected records ARE re-run through the reject-severity validation
-  rules** (`api/validation.py`, mirroring `column_rules.csv`) before reprocessing.
+  rules** (`api/validation.py`, mirroring `bus_rules.column_rules`) before reprocessing.
   If the correction still fails validation, the steward sees an alert explaining
   what's still wrong and the record stays in the exception queue — it is not
   marked resolved and does not reach match/merge. Only once a correction
   genuinely passes validation does it flow through, at which point the "modified"
-  timestamp is stamped as the moment of correction, so under the recency-wins
-  survivorship rule a fresh correction will typically become the new survivor.
+  timestamp is stamped as the moment of correction, so under a `newest`-rule gold
+  column (the default for every column until a governance user tunes it) a fresh
+  correction will typically become the new winner for that column.
 - The real-time reprocessing match step compares against each existing golden
-  record's *current* (survivor) email/phone, not every historical non-survivor
-  source in that group — consistent with the record-level (not attribute-level)
-  survivorship design used elsewhere in this demo.
+  record's *current* email/phone (whichever source currently wins those specific
+  columns), not every historical source in that group.
 - Golden IDs created via real-time reprocessing are numbered by incrementing the
   current max, which can diverge from what a full `dbt run` from scratch would
   assign (dbt's match-group numbering is order-dependent on the complete silver

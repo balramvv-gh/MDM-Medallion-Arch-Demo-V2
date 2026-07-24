@@ -77,11 +77,13 @@ def trace_golden_record(golden_id: str):
             f"SELECT * FROM bronze.{raw_table} WHERE source_record_id = ?",
             [row.source_record_id],
         )
+        winning_columns = list(row.winning_columns) if row.winning_columns is not None else []
         contributing_sources.append({
             "source_system": row.source_system,
             "source_record_id": row.source_record_id,
             "match_confidence_score": float(row.match_confidence_score),
             "is_survivor_record": bool(row.is_survivor_record),
+            "winning_columns": winning_columns,
             "raw_bronze_data": to_records(raw)[0] if not raw.empty else None,
         })
 
@@ -89,6 +91,8 @@ def trace_golden_record(golden_id: str):
     return {
         "golden_id": golden_id,
         "contributing_sources": contributing_sources,
-        "note": "Gold record is a survivorship merge of the contributing sources above. "
-                "See /lineage/impact for full column-level transformation rules.",
+        "note": "Gold record is an attribute-level survivorship merge of the contributing "
+                "sources above -- each source's winning_columns shows which specific gold "
+                "columns it won (Data Governance > Rules Configuration > Survivorship "
+                "Rules). See /lineage/impact for full column-level transformation rules.",
     }

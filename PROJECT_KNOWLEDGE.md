@@ -18,32 +18,39 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 
 - **Bronze** — raw CRM + ERP extracts landed untouched, tagged with source_system/source_record_id.
 - **Silver** — canonical, validated records only. Cleansing/standardization/validation is
-  **metadata-driven**: rules live in `dbt_project/seeds/column_rules.csv` (rule_id, source
-  column, rule_type, severity), not hardcoded in pipeline code. Records failing validation
+  **metadata-driven**: rules live in `bus_rules.column_rules` (rule_id, source column,
+  rule_type, severity) — a DB-native table maintained via the Data Governance > Rules
+  Configuration screen's maker-checker workflow, not a dbt seed. Records failing validation
   route to an exception queue instead of silver.
 - **Gold (Data Hub)** — hybrid match/merge across sources, and **fully metadata-driven**:
-  tier definitions/thresholds live in `dbt_project/seeds/matching_thresholds.csv` and the
-  fields/columns each tier operates on live in `dbt_project/seeds/matching_rules.csv` (a
+  tier definitions/thresholds live in `bus_rules.matching_thresholds` and the
+  fields/columns each tier operates on live in `bus_rules.matching_rules` (a
   child table keyed by tier_id) — nothing about *what* matches is hardcoded in pipeline
-  code, mirroring the same pattern `column_rules.csv` already established for silver
-  validation. Today's seed configures two tiers: tier 1 is deterministic exact match on
+  code, mirroring the same pattern `bus_rules.column_rules` already established for silver
+  validation. Today's configuration has two tiers: tier 1 is deterministic exact match on
   normalized email OR phone (confidence = that tier's `auto_merge_threshold`, 1.00); tier 2
   is an embedding-similarity fuzzy match (TF-IDF character n-gram cosine similarity over
   name/address text, blocked by state_code) that catches near-duplicates tier 1 misses.
   High-confidence fuzzy matches auto-merge with their similarity score as confidence;
   borderline ones surface in a **Match Review queue** for a data steward to confirm or
-  reject rather than auto-merging. A third, non-tier seed row (`is_match_tier=false`)
+  reject rather than auto-merging. A third, non-tier row (`is_match_tier=false`)
   holds the 0.50 "provisional" baseline confidence assigned to a single-source golden
   record with no corroborating match at all — read by both the batch gold layer and
   real-time reprocessing, so they can't disagree on it. Computed in
   `scripts/generate_matches.py`, which runs as a Python step between silver and gold
   (dbt-duckdb can't do the embedding math in SQL) and writes to a `gold_prep` schema that
   the gold dbt models consume as a source — same "Python loads, dbt treats it as a source"
-  pattern already used for bronze. Record-level survivorship (most-recently-modified
-  source wins, CRM preferred as tiebreak) and a **crosswalk table** preserve the
-  relationship between every golden record and its contributing source records, with a
-  graduated match confidence score also sourced from the seed (`gold_crosswalk.sql`,
-  not hardcoded literals).
+  pattern also used for bronze and for `ref`/`bus_rules` themselves. **Survivorship is
+  attribute-level**, not record-level: each gold column is independently won by whichever
+  contributing source best satisfies that column's own `bus_rules.survivorship_rules` rule
+  (`most_common` / `most_complete` / `oldest` / `newest` / `pattern_match`), with
+  `source_modified_date` desc (then CRM preferred) as the universal, non-configurable
+  tie-break whenever a rule doesn't produce a clean winner — see
+  `dbt_project/models/gold/gold_survivorship_winners.sql`. A **crosswalk table**
+  (`gold_crosswalk`) preserves the relationship between every golden record and its
+  contributing source records, with a graduated match confidence score (not hardcoded
+  literals) plus a `winning_columns` list per source showing exactly which gold columns
+  that source won (`is_survivor_record` is now simply "won at least one column").
 
 ## Tech stack
 
@@ -131,8 +138,9 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
      deletes an audit row once written, which is the actual enforcement mechanism (DuckDB
      has no per-table grants to lean on here, same app-level-only security model as
      `gold_access` itself). See `api/audit.py` and Key data model notes below.
-   - **Data Governance** (nav dropdown, two independently-gated items — the dropdown
-     itself hides if neither is visible to the signed-in user):
+   - **Data Governance** (nav dropdown, four items; the first two are role-gated, the
+     last two are visible to every signed-in user since they're read-only outside
+     dataSteward/dataOwner — the dropdown itself is therefore always shown now):
      - **Data Stewardship** — visible only to `dataSteward`/`dataOwner` (same role gate
        as the console). Opens `/app/` via `window.open('/app/', 'mdmStewardshipTab')`;
        clicking again while that named tab is still open re-focuses it instead of
@@ -148,6 +156,25 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
        (green) directly on the graph, with a side detail panel (description, direct
        in/out rules, upstream/downstream counts). Clicking a gold node adds a Golden ID
        lookup tool.
+     - **Reference Data Maintenance** — Country Codes and State Codes (`ref.ref_country_codes`
+       / `ref.ref_state_codes`, DB-native, each with a human-readable name/label column and
+       an `is_active` flag; no hard delete, same "deactivate" convention as everywhere else
+       in this app). Visible to everyone; create/edit/deactivate forms are only shown to
+       `dataSteward`/`dataOwner` (everyone else gets a read-only table) and submit into the
+       `reference_data_change` maker-checker workflow (1 level, 1 Data Owner). dbt's silver
+       staging models (`stg_crm_customers.sql`, `stg_erp_customers.sql`) read these two
+       tables as a `{{ source('ref', ...) }}` instead of a seed, so an approved edit here
+       takes effect on the next pipeline rebuild.
+     - **Rules Configuration** — Column Rules, Matching Rules (plus their tier definitions,
+       "Matching Tiers"), and the new **Survivorship Rules** (`bus_rules.column_rules` /
+       `matching_rules` / `matching_thresholds` / `survivorship_rules`, all DB-native).
+       Same visibility/gating pattern as Reference Data Maintenance, but submissions go
+       into the higher-risk `rules_config_change` workflow (1 level, quorum of 2 *different*
+       Data Owners) since these rules govern what the batch pipeline rejects, matches, and
+       survives. One workflow_type covers all four sub-tables; `entity_type` on the
+       workflow instance distinguishes which one a given submission targets. dbt's
+       `gold_crosswalk.sql` and `gold_survivorship_winners.sql` read `bus_rules.*` as
+       sources; `scripts/generate_matches.py` and `api/reprocessing.py` query them directly.
    - **Administration → User Administration** — admin-only. Create/edit/deactivate users,
      assign role (`admin`/`dataSteward`/`dataOwner`/`businessUser`) and gold access
      (`read_write`/`read`/`none`), reset passwords. The seed admin account is `mdm_admin`, created via
@@ -169,10 +196,12 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
    approver, >1 for a same-level quorum of *different* people). The engine itself
    enforces, independent of any caller: a maker can never decide on their own
    submission, the same approver can never cast two decisions on one instance, and
-   rejection at any step is terminal. Four workflows are configured today:
+   rejection at any step is terminal. Six workflows are configured today:
    `stewardship_remediation` (1 level, 1 Data Owner), `gold_record_edit` (1 level,
    quorum of 2 Data Owners), `match_review_confirmation` (2 sequential levels: Data
-   Owner, then Admin), and `user_admin_change` (1 level, 1 Admin). Generic endpoints —
+   Owner, then Admin), `user_admin_change` (1 level, 1 Admin), `reference_data_change`
+   (1 level, 1 Data Owner — Reference Data Maintenance), and `rules_config_change`
+   (1 level, quorum of 2 Data Owners — Rules Configuration). Generic endpoints —
    `GET /api/v1/workflows/pending`, `GET /api/v1/workflows/mine`,
    `GET /api/v1/workflows/{instance_id}`, `POST /api/v1/workflows/{instance_id}/decide`
    — serve an **Approvals** view in both the Stewardship Console and the Portal (the
@@ -187,32 +216,56 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 
 ## Key data model notes
 
-- `dbt_project/seeds/column_rules.csv` — the single source of truth for cleansing/
-  standardization/validation rules, referenced by rule ID (R001, R002...) throughout the
-  pipeline, the exception queue's reject_reasons, and the stewardship UI.
+- `bus_rules.column_rules` — the single source of truth for cleansing/standardization/
+  validation rules, referenced by rule ID (R001, R002...) throughout the pipeline, the
+  exception queue's reject_reasons, and the stewardship UI. DB-native (schema `bus_rules`),
+  maintained via the Rules Configuration screen's maker-checker workflow — migrated off
+  `dbt_project/seeds/column_rules.csv` when that screen was built.
 - `dbt_project/seeds/lineage_edges.csv` — column-level lineage metadata (from_layer/table/
   column → to_layer/table/column, transform_rule_id, description). Powers both the
-  Data Governance network diagram and the `/api/v1/lineage/*` endpoints. Note: wildcard
-  nodes (e.g. `gold.gold_match_candidates.*`) must be explicitly linked to specific
-  columns or impact-analysis chains silently break — this bit us once already, and again
-  when the match/merge step moved into `gold_prep` (matching layer is now `gold_prep`,
-  edges E013/E014/E018-E026 cover it; re-verify with `/api/v1/lineage/impact` and
-  `/trace` after touching this file, don't just eyeball it).
-- `dbt_project/seeds/matching_thresholds.csv` — one row per matching tier (tier_id,
-  tier_order, tier_name, match_method, is_match_tier, auto_merge_threshold,
-  review_lower_threshold, active, description). `match_method` is `'exact'` or
-  `'fuzzy_tfidf_cosine'` today; a non-tier row (`is_match_tier=false`,
+  Data Governance network diagram and the `/api/v1/lineage/*` endpoints. Still a dbt seed
+  (out of scope for the Rules Configuration migration). Note: wildcard nodes (e.g.
+  `gold.gold_match_candidates.*`) must be explicitly linked to specific columns or
+  impact-analysis chains silently break — this bit us once already, and again when the
+  match/merge step moved into `gold_prep` (matching layer is now `gold_prep`, edges
+  E013/E014/E018-E026 cover it; re-verify with `/api/v1/lineage/impact` and `/trace` after
+  touching this file, don't just eyeball it).
+- `bus_rules.matching_thresholds` — one row per matching tier (tier_id, tier_order,
+  tier_name, match_method, is_match_tier, auto_merge_threshold, review_lower_threshold,
+  active, description). DB-native, maintained via Rules Configuration's "Matching Tiers"
+  tab (migrated off `dbt_project/seeds/matching_thresholds.csv`). `match_method` is
+  `'exact'` or `'fuzzy_tfidf_cosine'` today; a non-tier row (`is_match_tier=false`,
   `match_method='no_match_baseline'`) holds the 0.50 provisional-confidence value.
   Adding a tier means adding a row here (plus its rules below) — nothing in
   `scripts/generate_matches.py` or `api/reprocessing.py` needs to change to add another
   exact or fuzzy tier, only to add a genuinely new match_method.
-- `dbt_project/seeds/matching_rules.csv` — child table keyed by `tier_id`, one row per
-  field/column a tier operates on (rule_role is `exact_match_field`, `similarity_text_field`,
-  or `blocking_key`; `transform_function` is `none`/`normalize_email`/`normalize_phone`,
+- `bus_rules.matching_rules` — child table keyed by `tier_id`, one row per field/column a
+  tier operates on (rule_role is `exact_match_field`, `similarity_text_field`, or
+  `blocking_key`; `transform_function` is `none`/`normalize_email`/`normalize_phone`,
   applied identically in both Python (`scripts/generate_matches.py`, `api/reprocessing.py`)
-  and SQL (`gold_crosswalk.sql`'s tier lookups) via matching name-keyed registries). Multiple
-  `blocking_key` rows for one tier compose into a multi-column blocking key;
-  `rule_order` controls concatenation order for `similarity_text_field` rows.
+  and SQL (`gold_crosswalk.sql`'s tier lookups) via matching name-keyed registries). DB-native,
+  maintained via Rules Configuration's "Matching Rules" tab (migrated off
+  `dbt_project/seeds/matching_rules.csv`). Multiple `blocking_key` rows for one tier compose
+  into a multi-column blocking key; `rule_order` controls concatenation order for
+  `similarity_text_field` rows.
+- `bus_rules.survivorship_rules` — new: one active rule per gold column (`target_column`),
+  driving attribute-level survivorship. `rule_type` is `most_common` (the non-blank value
+  appearing in the most contributing records), `most_complete` (prefers non-blank over
+  blank), `oldest`/`newest` (by `source_modified_date`), or `pattern_match` (prefers a value
+  matching `rule_param`, a regex). Exactly one primary rule per column; whenever it doesn't
+  produce a clean winner, `source_modified_date` desc (then CRM preferred) is the universal,
+  non-configurable tie-break — not itself a further stack of configurable rules. Defaults
+  (seeded by `api/db.py`/`scripts/ensure_governed_schemas.py`) are all `newest`, which
+  reproduces the previous record-level behavior exactly until a governance user tunes a
+  specific column. Evaluated by `dbt_project/models/gold/gold_survivorship_winners.sql`
+  (batch) and `api/reprocessing.py`'s `_pick_column_winners()` (real-time) — the two must
+  stay in lockstep.
+- `ref.ref_country_codes` / `ref.ref_state_codes` — DB-native reference data (schema `ref`),
+  maintained via the Reference Data Maintenance screen's maker-checker workflow. Each has a
+  human-readable `country_name`/`state_name` label alongside the code, plus `is_active`
+  (migrated off `dbt_project/seeds/ref_country_codes.csv` / `ref_state_codes.csv`, which
+  only had the bare code). `api/validation.py` queries these live (no caching) since, unlike
+  the old static seed, they can change at runtime.
 - `gold_prep.match_groups` / `match_edges` / `match_review_candidates` — written by
   `scripts/generate_matches.py` (not dbt-built), same "Python loads, dbt treats it as a
   source" pattern as bronze. `match_edges` is the audit trail dbt joins to compute
@@ -235,8 +288,10 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   anywhere issues an UPDATE/DELETE against this table.
 - `governance.workflow_definitions` / `workflow_instances` / `workflow_decisions` — the
   maker-checker engine's own tables (`api/workflow_engine.py`). Definitions are seeded
-  once (first boot with an empty table) and then left alone so future edits (planned
-  Rules Configuration screen) persist across restarts; instances carry a JSON `payload`
+  per `workflow_type` (an existing type is never re-seeded, but a newly-added one — like
+  `reference_data_change`/`rules_config_change` when Rules Configuration shipped — is
+  backfilled into an already-running DB on next app start) so runtime edits persist across
+  restarts; instances carry a JSON `payload`
   (whatever the completion callback needs to apply the change) and, once
   approved/rejected, a JSON `result`; decisions are one row per approver per step, which
   is how the engine enforces "no double-deciding" and quorum counts.
@@ -252,21 +307,27 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   Real-time reprocessing (steward resolves an exception → immediate re-match) still only
   evaluates the `match_method='exact'` tier -- fitting a TF-IDF vectorizer per API request
   was judged not worth the latency for a demo-scoped feature. Both paths read the same
-  `exact_match_field` rules from `matching_rules.csv`, so they can't drift on *which*
+  `exact_match_field` rules from `bus_rules.matching_rules`, so they can't drift on *which*
   fields count as an exact match, even though only the batch step can also run a fuzzy
   tier. A confirmed/rejected Match Review decision similarly only takes effect on the
   next batch rebuild, not instantly.
 - The fuzzy tier is TF-IDF character n-gram cosine similarity, not a neural sentence
   embedding -- a deliberate lightweight choice (see Tech stack); the vectorizer's shape
   (char_wb analyzer, 2-4 char n-grams) is a fixed code constant in `generate_matches.py`,
-  not seed metadata. Thresholds (0.80 auto-merge, 0.35 review floor today) live in
-  `matching_thresholds.csv`'s `auto_merge_threshold`/`review_lower_threshold` columns for
-  the fuzzy tier row, not hardcoded constants -- change the seed value and rerun to
-  recalibrate, no code edit needed. Original calibration was empirical, against this
-  project's synthetic data generator's 12 seeded fuzzy-duplicate pairs vs. every
-  same-state non-duplicate pair; re-calibrate (and update the seed) if the generator's
-  population changes materially.
-- Survivorship is record-level (whole record from one winning source), not attribute-level.
+  not rule metadata. Thresholds (0.80 auto-merge, 0.35 review floor today) live in
+  `bus_rules.matching_thresholds`'s `auto_merge_threshold`/`review_lower_threshold` columns
+  for the fuzzy tier row, not hardcoded constants -- edit the row (via Rules Configuration,
+  maker-checker approved) and rerun to recalibrate, no code edit needed. Original
+  calibration was empirical, against this project's synthetic data generator's 12 seeded
+  fuzzy-duplicate pairs vs. every same-state non-duplicate pair; re-calibrate if the
+  generator's population changes materially.
+- Attribute-level survivorship's `most_common`/`most_complete`/`pattern_match` rule types
+  are evaluated independently per column across whatever sources contributed to that match
+  group -- there's no cross-column consistency check (e.g. a golden record could in theory
+  draw `city` from one source and `state_code` from another even if that pairing wouldn't
+  occur together in any single real source record). Accepted for a demo-scoped feature;
+  a production system would likely want a "prefer values from the same winning source when
+  reasonably possible" refinement.
 - Steward corrections ARE re-validated against the reject-severity metadata rules
   (`api/validation.py`, mirroring `column_rules.csv`) before reprocessing runs — a
   correction that still fails validation is rejected with an alert and the record
@@ -288,9 +349,7 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
   by itself, e.g. after a Match Review confirm/reject).
 - Auth is sized for a demo: no MFA, no refresh tokens, single local DuckDB file (not a
   concurrent multi-user warehouse).
-- The maker-checker engine only gates the four workflows listed above; Reference Data
-  Maintenance and Rules Configuration (planned Data Governance screens, not yet built)
-  aren't covered by it yet. If the domain action itself fails after every required
+- If the domain action itself fails after every required
   approval is already recorded (e.g. a downstream write error), the instance is still
   marked `approved` — the human decision stands — with the failure captured in its
   `result` field rather than silently rolled back; there is no automatic retry. A
@@ -303,15 +362,20 @@ systems (a CRM and an ERP), so schema standardization is a real problem, not a f
 ```
 data/                  synthetic CRM+ERP source data generator (Faker-based, ~100 rows/source)
 scripts/                load_bronze.py, generate_matches.py (fuzzy match/merge, Python step
-                        between silver and gold), build_pipeline.py (runs the 5-stage build),
+                        between silver and gold), build_pipeline.py (runs the 6-stage build,
+                        step 0 = ensure_governed_schemas.py), ensure_governed_schemas.py
+                        (provisions ref.*/bus_rules.* before dbt runs -- see its docstring),
                         audit_pipeline_diff.py (gold-layer audit trail diff, final build
                         step), create_admin_user.py, reset_admin_password.py,
                         create_demo_governance_users.py (seeds extra dataOwner/admin
                         accounts needed to test maker-checker quorums/multi-level chains)
-dbt_project/            seeds (rules/reference/lineage/matching metadata -- column_rules.csv,
-                        matching_thresholds.csv, matching_rules.csv, lineage_edges.csv,
-                        ref_state_codes.csv, ref_country_codes.csv), models (silver, gold);
-                        gold reads scripts/generate_matches.py's output via the gold_prep source
+dbt_project/            seeds (only lineage_edges.csv now -- column_rules.csv,
+                        matching_thresholds.csv, matching_rules.csv, ref_state_codes.csv,
+                        and ref_country_codes.csv migrated to DB-native bus_rules/ref
+                        schemas when Rules Configuration/Reference Data Maintenance
+                        shipped), models (silver, gold); gold reads
+                        scripts/generate_matches.py's output via the gold_prep source and
+                        bus_rules.*/ref.* via their own sources
 api/                    FastAPI app: main.py, db.py, auth.py, reprocessing.py,
                         lineage.py, ai_remediation.py, audit.py (gold-layer audit trail),
                         workflow_engine.py (generic maker-checker workflow engine)
@@ -326,13 +390,8 @@ README.md               Windows-first setup instructions (PowerShell), plus macO
 
 ## Outstanding / not yet built
 
-- Two new Data Governance menu items, both meant to reuse the maker-checker workflow
-  engine once built: **Reference Data Maintenance** (Country Codes, State Codes, etc.)
-  and **Rules Configuration** (letting Data Governance users create/maintain Column
-  Rules, Matching Rules, and Survivorship Rules through the UI instead of a direct
-  seed-file edit). The engine and its `governance.workflow_definitions` table are
-  already designed to support this — a new `workflow_type` per screen is the expected
-  extension point, not a redesign.
+- Attribute-level survivorship's cross-column consistency (see Known simplifications) is
+  an accepted gap, not a planned build item.
 - CCA-F (Claude Certified Architect – Foundations) certification is a separate, unrelated
   thread the user is pursuing — exam access is gated behind the Claude Partner Network with
   no individual registration path found so far; using Skilljar course-completion

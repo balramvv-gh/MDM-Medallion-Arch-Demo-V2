@@ -285,6 +285,8 @@
           <span class="dropdown-menu">
             <button id="navStewardship" onclick="launchStewardshipApp()">Data Stewardship</button>
             <button id="navLineage" onclick="showView('lineage')">Lineage and Impact Analysis</button>
+            <button id="navRefData" onclick="showView('refdata')">Reference Data Maintenance</button>
+            <button id="navRulesConfig" onclick="showView('rulesconfig')">Rules Configuration</button>
           </span>
         </span>
         <span class="dropdown" id="adminDropdown">
@@ -336,6 +338,46 @@
         </thead>
         <tbody id="userRows"></tbody>
       </table>
+    </div>
+
+    <!-- Data Governance: Reference Data Maintenance -->
+    <div class="view" id="view-refdata">
+      <div class="toolbar">
+        <span style="font-size:15px;font-weight:700;">Data Governance — Reference Data Maintenance</span>
+        <div style="display:flex;gap:8px;margin-left:16px;">
+          <button class="btn-secondary refdata-tab" data-tab="ref_country_code" style="padding:7px 14px;border-radius:6px;font-size:12px;" onclick="switchRefDataTab('ref_country_code')">Country Codes</button>
+          <button class="btn-secondary refdata-tab" data-tab="ref_state_code" style="padding:7px 14px;border-radius:6px;font-size:12px;" onclick="switchRefDataTab('ref_state_code')">State Codes</button>
+        </div>
+        <button class="btn-primary" id="refDataNewBtn" style="margin-left:auto;padding:9px 16px;border-radius:7px;border:none;font-weight:700;cursor:pointer;" onclick="openRefDataForm()">+ New code</button>
+      </div>
+      <table>
+        <thead><tr><th>CODE</th><th>NAME</th><th>STATUS</th><th></th></tr></thead>
+        <tbody id="refDataRows"></tbody>
+      </table>
+      <div style="font-size:11px;color:var(--text-dim);margin-top:10px;">
+        Create, edit, and deactivate require Data Steward or Data Owner and go through maker-checker approval (1 Data Owner, different from whoever submitted it). Everyone else sees this list read-only.
+      </div>
+    </div>
+
+    <!-- Data Governance: Rules Configuration -->
+    <div class="view" id="view-rulesconfig">
+      <div class="toolbar" style="flex-wrap:wrap;">
+        <span style="font-size:15px;font-weight:700;">Data Governance — Rules Configuration</span>
+        <div style="display:flex;gap:8px;margin-left:16px;flex-wrap:wrap;">
+          <button class="btn-secondary rules-tab" data-tab="column_rule" style="padding:7px 14px;border-radius:6px;font-size:12px;" onclick="switchRulesTab('column_rule')">Column Rules</button>
+          <button class="btn-secondary rules-tab" data-tab="matching_rule" style="padding:7px 14px;border-radius:6px;font-size:12px;" onclick="switchRulesTab('matching_rule')">Matching Rules</button>
+          <button class="btn-secondary rules-tab" data-tab="matching_threshold" style="padding:7px 14px;border-radius:6px;font-size:12px;" onclick="switchRulesTab('matching_threshold')">Matching Tiers</button>
+          <button class="btn-secondary rules-tab" data-tab="survivorship_rule" style="padding:7px 14px;border-radius:6px;font-size:12px;" onclick="switchRulesTab('survivorship_rule')">Survivorship Rules</button>
+        </div>
+        <button class="btn-primary" id="rulesNewBtn" style="margin-left:auto;padding:9px 16px;border-radius:7px;border:none;font-weight:700;cursor:pointer;" onclick="openRulesForm()">+ New rule</button>
+      </div>
+      <table>
+        <thead id="rulesTableHead"></thead>
+        <tbody id="rulesRows"></tbody>
+      </table>
+      <div style="font-size:11px;color:var(--text-dim);margin-top:10px;">
+        Create, edit, and deactivate require Data Steward or Data Owner and go through maker-checker approval (quorum of 2 Data Owners). Everyone else sees this list read-only.
+      </div>
     </div>
 
     <!-- Approvals (generic maker-checker) -->
@@ -446,6 +488,41 @@
   </div>
 </div>
 
+<!-- Reference Data Maintenance form modal -->
+<div class="modal-backdrop" id="refDataModal">
+  <div class="modal">
+    <button class="btn-close" onclick="closeModal('refDataModal')">×</button>
+    <h2 id="refDataModalTitle">New code</h2>
+    <div class="modal-field"><label id="rf_code_label">CODE</label><input type="text" id="rf_code"></div>
+    <div class="modal-field"><label id="rf_name_label">NAME</label><input type="text" id="rf_name"></div>
+    <div class="modal-field" id="rf_active_field" style="display:none;">
+      <label>STATUS</label>
+      <select id="rf_is_active"><option value="true">active</option><option value="false">deactivated</option></select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-secondary" onclick="closeModal('refDataModal')">Cancel</button>
+      <button class="btn-primary" onclick="saveRefData()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Rules Configuration form modal -->
+<div class="modal-backdrop" id="rulesModal">
+  <div class="modal">
+    <button class="btn-close" onclick="closeModal('rulesModal')">×</button>
+    <h2 id="rulesModalTitle">New rule</h2>
+    <div id="rulesFormFields"></div>
+    <div class="modal-field" id="rf2_active_field" style="display:none;">
+      <label>STATUS</label>
+      <select id="rf2_is_active"><option value="true">active</option><option value="false">deactivated</option></select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn-secondary" onclick="closeModal('rulesModal')">Cancel</button>
+      <button class="btn-primary" onclick="saveRulesConfig()">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- Approval decision modal -->
 <div class="modal-backdrop" id="approvalModal">
   <div class="modal">
@@ -495,13 +572,18 @@ function enterApp() {
   // Data Governance sub-items: Data Stewardship requires the same role gate as the
   // Stewardship console itself (dataSteward/dataOwner -- api/auth.py's
   // require_steward_or_owner); Lineage and Impact Analysis requires gold-layer
-  // access (read or read_write). The parent menu is hidden only if neither
-  // sub-item would be visible, so it's never shown empty.
+  // access (read or read_write). Reference Data Maintenance and Rules
+  // Configuration are visible to every authenticated user -- CRUD (create/
+  // edit/deactivate) is restricted to dataSteward/dataOwner within those
+  // screens themselves (see canWriteGovernance()), but everyone else still
+  // gets read-only access, per how those two screens are scoped. The parent
+  // menu itself is therefore always shown now that two of its four items are
+  // always visible.
   const canSteward = session.user.role === 'dataSteward' || session.user.role === 'dataOwner';
   const canGold = session.user.gold_access === 'read' || session.user.gold_access === 'read_write';
   document.getElementById('navStewardship').style.display = canSteward ? 'block' : 'none';
   document.getElementById('navLineage').style.display = canGold ? 'block' : 'none';
-  document.getElementById('govDropdown').style.display = (canSteward || canGold) ? 'inline-block' : 'none';
+  document.getElementById('govDropdown').style.display = 'inline-block';
 
   loadCustomers();
 }
@@ -567,6 +649,15 @@ function showView(name) {
   if (name === 'users') loadUsers();
   if (name === 'lineage') initLineageView();
   if (name === 'approvals') loadApprovals();
+  if (name === 'refdata') loadRefData();
+  if (name === 'rulesconfig') loadRulesConfig();
+}
+
+// Reference Data Maintenance and Rules Configuration are both read-only for
+// everyone except dataSteward/dataOwner (api/main.py's
+// auth_mod.require_steward_or_owner gates the write endpoints identically).
+function canWriteGovernance() {
+  return session.user.role === 'dataSteward' || session.user.role === 'dataOwner';
 }
 
 function toggleDropdown(id) {
@@ -651,12 +742,16 @@ async function openCustomer(goldenId) {
 
   const srcRes = await fetch(`${API}/customers/${goldenId}/sources`, { headers: authHeaders() });
   const srcData = await srcRes.json();
-  document.getElementById('crosswalkList').innerHTML = srcData.sources.map(s => `
+  document.getElementById('crosswalkList').innerHTML = srcData.sources.map(s => {
+    const wonCols = s.winning_columns || [];
+    const badge = wonCols.length ? `★ won: ${wonCols.join(', ')}` : '';
+    return `
     <div class="crosswalk-item">
-      <span>${s.source_system} · ${s.source_record_id} ${s.is_survivor_record ? '★ survivor' : ''}</span>
+      <span>${s.source_system} · ${s.source_record_id} ${badge}</span>
       <span>confidence: ${s.match_confidence_score.toFixed(2)}</span>
     </div>
-  `).join('');
+  `;
+  }).join('');
 
   document.getElementById('customerModal').classList.add('open');
 }
@@ -834,6 +929,203 @@ async function resetUserPassword() {
   }
 }
 
+// ---------------- Data Governance: Reference Data Maintenance ----------------
+
+const REF_DATA_TABS = {
+  ref_country_code: { label: 'Country Codes', codeField: 'country_code', nameField: 'country_name', codeLabel: 'Country Code', nameLabel: 'Country Name' },
+  ref_state_code: { label: 'State Codes', codeField: 'state_code', nameField: 'state_name', codeLabel: 'State Code', nameLabel: 'State Name' },
+};
+let refDataTab = 'ref_country_code';
+let editingRefCode = null;
+
+function switchRefDataTab(tab) {
+  refDataTab = tab;
+  document.querySelectorAll('.refdata-tab').forEach(b => b.classList.toggle('btn-primary', b.dataset.tab === tab));
+  loadRefData();
+}
+
+async function loadRefData() {
+  document.querySelectorAll('.refdata-tab').forEach(b => b.classList.toggle('btn-primary', b.dataset.tab === refDataTab));
+  const cfg = REF_DATA_TABS[refDataTab];
+  const canWrite = canWriteGovernance();
+  document.getElementById('refDataNewBtn').style.display = canWrite ? 'inline-block' : 'none';
+
+  const res = await fetch(`${API}/reference-data/${refDataTab}`, { headers: authHeaders() });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('refDataRows').innerHTML = data.items.length ? data.items.map(row => {
+    const code = row[cfg.codeField];
+    const name = row[cfg.nameField];
+    return `
+    <tr>
+      <td style="font-family:var(--mono);">${escapeXml(code)}</td>
+      <td>${escapeXml(name || '')}</td>
+      <td>${row.is_active ? '<span style="color:var(--green);">active</span>' : '<span style="color:var(--red);">deactivated</span>'}</td>
+      <td>${canWrite ? `<button class="btn-secondary" style="padding:5px 10px;border-radius:5px;font-size:11px;cursor:pointer;" onclick='openRefDataForm(${JSON.stringify(row)})'>Edit</button>` : ''}</td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="4" style="color:var(--text-dim);">No rows.</td></tr>`;
+}
+
+function openRefDataForm(row) {
+  const cfg = REF_DATA_TABS[refDataTab];
+  editingRefCode = row ? row[cfg.codeField] : null;
+  document.getElementById('refDataModalTitle').textContent = row ? `Edit ${row[cfg.codeField]}` : `New ${cfg.codeLabel}`;
+  document.getElementById('rf_code_label').textContent = cfg.codeLabel.toUpperCase();
+  document.getElementById('rf_code').value = row ? row[cfg.codeField] : '';
+  document.getElementById('rf_code').disabled = !!row;
+  document.getElementById('rf_name_label').textContent = cfg.nameLabel.toUpperCase();
+  document.getElementById('rf_name').value = row ? (row[cfg.nameField] || '') : '';
+  document.getElementById('rf_active_field').style.display = row ? 'block' : 'none';
+  document.getElementById('rf_is_active').value = row ? String(row.is_active) : 'true';
+  document.getElementById('refDataModal').classList.add('open');
+}
+
+async function saveRefData() {
+  const body = {
+    entity_type: refDataTab,
+    code: document.getElementById('rf_code').value.trim(),
+    name: document.getElementById('rf_name').value.trim() || null,
+  };
+  if (editingRefCode) body.is_active = document.getElementById('rf_is_active').value === 'true';
+  const res = await fetch(`${API}/reference-data`, { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+  const data = await res.json();
+  if (res.ok) {
+    const steps = (data.steps || []).map(s => s.step_name).join(' → ');
+    showToast(`Submitted for approval${steps ? ' (' + steps + ')' : ''} — a Data Owner must sign off.`);
+    closeModal('refDataModal');
+    loadRefData();
+  } else {
+    showToast(data.detail || 'Submit failed.');
+  }
+}
+
+// ---------------- Data Governance: Rules Configuration ----------------
+
+const RULES_TABS = {
+  column_rule: {
+    label: 'Column Rules', pk: 'rule_id',
+    fields: [
+      ['source_system', 'Source System', 'select', ['CRM', 'ERP']],
+      ['source_column', 'Source Column', 'text'],
+      ['rule_type', 'Rule Type', 'select', ['not_null', 'regex', 'reference_state', 'reference_country', 'trim_case_proper', 'standardize_phone_us', 'lowercase']],
+      ['rule_param', 'Rule Param', 'text'],
+      ['severity', 'Severity', 'select', ['reject', 'correct']],
+      ['description', 'Description', 'text'],
+    ],
+  },
+  matching_rule: {
+    label: 'Matching Rules', pk: 'rule_id',
+    fields: [
+      ['tier_id', 'Tier ID', 'text'],
+      ['rule_role', 'Rule Role', 'select', ['exact_match_field', 'similarity_text_field', 'blocking_key']],
+      ['rule_order', 'Rule Order', 'number'],
+      ['source_column', 'Source Column', 'text'],
+      ['transform_function', 'Transform Function', 'select', ['none', 'normalize_email', 'normalize_phone']],
+      ['description', 'Description', 'text'],
+    ],
+  },
+  matching_threshold: {
+    label: 'Matching Tiers', pk: 'tier_id',
+    fields: [
+      ['tier_order', 'Tier Order', 'number'],
+      ['tier_name', 'Tier Name', 'text'],
+      ['match_method', 'Match Method', 'text'],
+      ['is_match_tier', 'Is Match Tier', 'select', ['true', 'false']],
+      ['auto_merge_threshold', 'Auto-Merge Threshold', 'number'],
+      ['review_lower_threshold', 'Review Lower Threshold', 'number'],
+      ['description', 'Description', 'text'],
+    ],
+  },
+  survivorship_rule: {
+    label: 'Survivorship Rules', pk: 'rule_id',
+    fields: [
+      ['target_column', 'Target Column', 'select', ['first_name', 'last_name', 'email', 'phone', 'address_line1', 'address_line2', 'city', 'state_code', 'postal_code', 'country_code']],
+      ['rule_type', 'Rule Type', 'select', ['most_common', 'most_complete', 'oldest', 'newest', 'pattern_match']],
+      ['rule_param', 'Rule Param (pattern_match only, a regex)', 'text'],
+      ['description', 'Description', 'text'],
+    ],
+  },
+};
+let rulesTab = 'column_rule';
+let editingRulesId = null;
+
+function switchRulesTab(tab) {
+  rulesTab = tab;
+  document.querySelectorAll('.rules-tab').forEach(b => b.classList.toggle('btn-primary', b.dataset.tab === tab));
+  loadRulesConfig();
+}
+
+async function loadRulesConfig() {
+  document.querySelectorAll('.rules-tab').forEach(b => b.classList.toggle('btn-primary', b.dataset.tab === rulesTab));
+  const cfg = RULES_TABS[rulesTab];
+  const canWrite = canWriteGovernance();
+  document.getElementById('rulesNewBtn').style.display = canWrite ? 'inline-block' : 'none';
+
+  const headers = ['ID', ...cfg.fields.map(f => f[1]), 'Status', ''];
+  document.getElementById('rulesTableHead').innerHTML = '<tr>' + headers.map(h => `<th>${h.toUpperCase()}</th>`).join('') + '</tr>';
+
+  const res = await fetch(`${API}/rules-config/${rulesTab}`, { headers: authHeaders() });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('rulesRows').innerHTML = data.items.length ? data.items.map(row => {
+    const idCell = `<td style="font-family:var(--mono);font-size:11px;">${escapeXml(row[cfg.pk])}</td>`;
+    const fieldCells = cfg.fields.map(([key]) => {
+      const v = row[key];
+      return `<td style="font-size:12px;">${v === null || v === undefined ? '' : escapeXml(String(v))}</td>`;
+    }).join('');
+    const statusCell = `<td>${row.is_active ? '<span style="color:var(--green);">active</span>' : '<span style="color:var(--red);">deactivated</span>'}</td>`;
+    const actionCell = `<td>${canWrite ? `<button class="btn-secondary" style="padding:5px 10px;border-radius:5px;font-size:11px;cursor:pointer;" onclick='openRulesForm(${JSON.stringify(row)})'>Edit</button>` : ''}</td>`;
+    return `<tr>${idCell}${fieldCells}${statusCell}${actionCell}</tr>`;
+  }).join('') : `<tr><td colspan="${headers.length}" style="color:var(--text-dim);">No rows.</td></tr>`;
+}
+
+function openRulesForm(row) {
+  const cfg = RULES_TABS[rulesTab];
+  editingRulesId = row ? row[cfg.pk] : null;
+  document.getElementById('rulesModalTitle').textContent = row ? `Edit ${row[cfg.pk]}` : `New ${cfg.label.replace(/s$/, '')}`;
+  document.getElementById('rulesFormFields').innerHTML = cfg.fields.map(([key, label, type, options]) => {
+    const raw = row ? row[key] : '';
+    const val = (raw === null || raw === undefined) ? '' : raw;
+    if (type === 'select') {
+      return `<div class="modal-field"><label>${label.toUpperCase()}</label><select id="rf2_${key}">${options.map(o => `<option value="${o}" ${String(val) === o ? 'selected' : ''}>${o}</option>`).join('')}</select></div>`;
+    }
+    return `<div class="modal-field"><label>${label.toUpperCase()}</label><input type="${type === 'number' ? 'number' : 'text'}" id="rf2_${key}" value="${escapeXml(String(val))}"></div>`;
+  }).join('');
+  document.getElementById('rf2_active_field').style.display = row ? 'block' : 'none';
+  document.getElementById('rf2_is_active').value = row ? String(row.is_active) : 'true';
+  document.getElementById('rulesModal').classList.add('open');
+}
+
+async function saveRulesConfig() {
+  const cfg = RULES_TABS[rulesTab];
+  const fields = {};
+  cfg.fields.forEach(([key, label, type]) => {
+    const el = document.getElementById(`rf2_${key}`);
+    let val = el.value;
+    if (type === 'number') {
+      val = val === '' ? null : Number(val);
+    } else if (key === 'is_match_tier') {
+      val = val === 'true';
+    } else if (val === '') {
+      val = null;
+    }
+    fields[key] = val;
+  });
+  if (editingRulesId) fields.is_active = document.getElementById('rf2_is_active').value === 'true';
+
+  const body = { entity_type: rulesTab, entity_id: editingRulesId, fields };
+  const res = await fetch(`${API}/rules-config`, { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) });
+  const data = await res.json();
+  if (res.ok) {
+    const steps = (data.steps || []).map(s => s.step_name).join(' → ');
+    showToast(`Submitted for approval${steps ? ' (' + steps + ')' : ''} — 2 Data Owners must sign off.`);
+    closeModal('rulesModal');
+    loadRulesConfig();
+  } else {
+    showToast(data.detail || 'Submit failed.');
+  }
+}
+
 // ---------------- Approvals (generic maker-checker) ----------------
 
 const WORKFLOW_TYPE_LABELS = {
@@ -841,6 +1133,8 @@ const WORKFLOW_TYPE_LABELS = {
   gold_record_edit: 'Gold Record Edit',
   match_review_confirmation: 'Match Review Confirmation',
   user_admin_change: 'User Administration',
+  reference_data_change: 'Reference Data Maintenance',
+  rules_config_change: 'Rules Configuration',
 };
 
 function summarizeApproval(inst) {
@@ -863,6 +1157,17 @@ function summarizeApproval(inst) {
     if (inst.action_type === 'create') return `Create user '${p.username}' (${p.role}, gold_access=${p.gold_access})`;
     const fieldStr = Object.entries(p.updates || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
     return `Update user ${inst.entity_id} — ${fieldStr}`;
+  }
+  if (inst.workflow_type === 'reference_data_change') {
+    const label = inst.entity_type === 'ref_country_code' ? 'country code' : 'state code';
+    const verb = inst.action_type === 'create' ? 'Create' : 'Update';
+    return `${verb} ${label} ${p.code}${p.name ? ' — ' + p.name : ''}${p.is_active === false ? ' (deactivate)' : ''}`;
+  }
+  if (inst.workflow_type === 'rules_config_change') {
+    const fieldStr = Object.entries(p.fields || {}).map(([k, v]) => `${k}: ${v}`).join(', ');
+    const verb = inst.action_type === 'create' ? 'Create' : 'Update';
+    const target = p.entity_id || '(new)';
+    return `${verb} ${inst.entity_type.replace(/_/g, ' ')} ${target} — ${fieldStr}`;
   }
   return JSON.stringify(p);
 }
@@ -1237,13 +1542,16 @@ async function lookupGoldenRecord() {
     return;
   }
   const data = await res.json();
-  resultEl.innerHTML = data.contributing_sources.map(s => `
+  resultEl.innerHTML = data.contributing_sources.map(s => {
+    const wonCols = s.winning_columns || [];
+    return `
     <div class="edge-row">
       <span class="edge-rule">${s.source_system} · ${s.source_record_id}</span>
-      ${s.is_survivor_record ? ' ★ survivor' : ''}
+      ${wonCols.length ? ` ★ won: ${wonCols.join(', ')}` : ''}
       <div class="edge-target">confidence ${s.match_confidence_score.toFixed(2)}</div>
     </div>
-  `).join('');
+  `;
+  }).join('');
 }
 
 function viewLineageForCurrentCustomer() {

@@ -20,13 +20,12 @@ result as a source table, the same pattern already used for the bronze layer
 (scripts/load_bronze.py Python-loads bronze; dbt treats it as a source).
 
 Matching is metadata-driven, not hardcoded. Tier definitions and thresholds
-live in dbt_project/seeds/matching_thresholds.csv (main_rules.matching_thresholds
-after `dbt seed`); the fields/columns each tier actually operates on live in
-dbt_project/seeds/matching_rules.csv (main_rules.matching_rules), a child
-table keyed by tier_id. This mirrors the existing column_rules.csv /
-ref_state_codes.csv pattern elsewhere in the project: rules are read from
-seeded DuckDB tables at runtime instead of hardcoded, so nothing can drift
-out of sync with what the seed says the rules are.
+live in bus_rules.matching_thresholds; the fields/columns each tier actually
+operates on live in bus_rules.matching_rules, a child table keyed by tier_id.
+Both are DB-native tables (not dbt seeds) maintained via the Rules
+Configuration screen's maker-checker workflow -- same "read from a DuckDB
+table at runtime instead of hardcoded" principle as before, just no longer
+sourced from a static CSV seed.
 
 Two-tier matching strategy, as configured today in the seeds (more tiers can
 be added by adding rows -- each tier's match_method must be either 'exact'
@@ -86,7 +85,7 @@ doesn't change.
 Known simplification: this batch step is the only place fuzzy
 (match_method='fuzzy_tfidf_cosine') matching runs. The real-time reprocessing
 path (api/reprocessing.py, triggered when a steward resolves a validation
-exception) also reads its match fields from main_rules.matching_rules now,
+exception) also reads its match fields from bus_rules.matching_rules now,
 but only ever evaluates the 'exact' tier -- extending it to fuzzy tiers would
 mean fitting a TF-IDF vectorizer per API request, which is a real
 latency/complexity cost for a demo-scoped feature. This mirrors this
@@ -201,17 +200,18 @@ def _ensure_match_review_tables(con):
 
 
 def _load_matching_metadata(con):
-    """Reads the two matching seed tables and returns (tiers, rules_by_tier),
-    where tiers is the list of active tier rows (as dicts) from
-    matching_thresholds, and rules_by_tier maps tier_id -> list of that
-    tier's active rule rows from matching_rules, in rule_order."""
+    """Reads the two matching tables (bus_rules schema, DB-native, maintained
+    via the Rules Configuration screen's maker-checker workflow) and returns
+    (tiers, rules_by_tier), where tiers is the list of active tier rows (as
+    dicts) from matching_thresholds, and rules_by_tier maps tier_id -> list of
+    that tier's active rule rows from matching_rules, in rule_order."""
     thresholds = con.execute("""
-        SELECT * FROM main_rules.matching_thresholds
+        SELECT * FROM bus_rules.matching_thresholds
         WHERE active ORDER BY tier_order
     """).fetchdf().to_dict(orient="records")
 
     rules = con.execute("""
-        SELECT * FROM main_rules.matching_rules
+        SELECT * FROM bus_rules.matching_rules
         WHERE active ORDER BY tier_id, rule_order
     """).fetchdf().to_dict(orient="records")
 
@@ -233,7 +233,7 @@ def main():
     if tier1 is None:
         raise RuntimeError(
             "No active tier with match_method='exact' found in "
-            "main_rules.matching_thresholds -- at least one exact tier is required."
+            "bus_rules.matching_thresholds -- at least one exact tier is required."
         )
 
     exact_rules = [r for r in rules_by_tier.get(tier1["tier_id"], []) if r["rule_role"] == "exact_match_field"]

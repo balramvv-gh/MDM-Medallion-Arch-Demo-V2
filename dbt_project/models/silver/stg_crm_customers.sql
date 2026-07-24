@@ -38,7 +38,7 @@ select
     (email is null or not regexp_matches(email, '^[^@\s]+@[^@\s]+\.[^@\s]+$')) as err_invalid_email,
     (phone is null) as err_missing_phone,
     -- R004: state reference check
-    (state_code is null or state_code not in (select state_code from {{ ref('ref_state_codes') }})) as err_invalid_state,
+    (state_code is null or state_code not in (select state_code from {{ source('ref', 'ref_state_codes') }} where is_active)) as err_invalid_state,
     -- R005: country reference check
-    (country_code is null or country_code not in (select country_code from {{ ref('ref_country_codes') }})) as err_invalid_country
+    (country_code is null or country_code not in (select country_code from {{ source('ref', 'ref_country_codes') }} where is_active)) as err_invalid_country
 from standardized
